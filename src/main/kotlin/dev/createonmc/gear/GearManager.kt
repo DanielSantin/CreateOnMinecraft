@@ -12,6 +12,7 @@ import org.bukkit.entity.Interaction
 import org.bukkit.entity.ItemDisplay
 import org.bukkit.inventory.ItemStack
 import org.bukkit.inventory.meta.ItemMeta
+import org.bukkit.persistence.PersistentDataType
 import org.bukkit.util.Transformation
 import org.joml.Quaternionf
 import org.joml.Vector3f
@@ -38,8 +39,23 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
     private var nextNetworkId = 0
     private var tickCount = 0
 
+    // ─── PDC keys (stored on the Interaction entity for persistence) ─────────
+    private val pdcGearType    = NamespacedKey(plugin, "gear_type")
+    private val pdcAxis        = NamespacedKey(plugin, "axis")
+    private val pdcOrientQ     = NamespacedKey(plugin, "orient_q")     // "x,y,z,w"
+    private val pdcIsMotor     = NamespacedKey(plugin, "is_motor")
+    private val pdcMotorSpeed  = NamespacedKey(plugin, "motor_speed")
+    private val pdcDisplayUuid = NamespacedKey(plugin, "display_uuid")
+    private val pdcExtraUuids  = NamespacedKey(plugin, "extra_uuids")  // comma-separated
+    private val pdcBX          = NamespacedKey(plugin, "bx")
+    private val pdcBY          = NamespacedKey(plugin, "by")
+    private val pdcBZ          = NamespacedKey(plugin, "bz")
+    private val pdcWorldName   = NamespacedKey(plugin, "world_name")
+
     init {
         plugin.server.scheduler.runTaskTimer(plugin, Runnable { tick() }, 0L, 1L)
+        // Delay restore by 1 tick so all worlds/chunks are ready
+        plugin.server.scheduler.runTask(plugin, Runnable { restoreFromWorld() })
     }
 
     fun setSpeed(rpm: Float) {
@@ -114,6 +130,7 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         )
         gearsByPos[pos] = entry
         interactionToPos[interaction.uniqueId] = pos
+        tagInteraction(interaction, entry)
 
         if (!connectGear(entry)) return false
 
@@ -430,6 +447,82 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         }
         primary.motorPositions.addAll(secondary.motorPositions)
         networks.remove(secondary.id)
+    }
+
+    // ─── Persistence ─────────────────────────────────────────────────────────
+
+    private fun tagInteraction(interaction: Interaction, entry: GearEntry) {
+        val pdc = interaction.persistentDataContainer
+        pdc.set(pdcGearType,    PersistentDataType.STRING, entry.gearType.name)
+        pdc.set(pdcAxis,        PersistentDataType.STRING, entry.axis.name)
+        pdc.set(pdcOrientQ,     PersistentDataType.STRING,
+            "${entry.orientQ.x},${entry.orientQ.y},${entry.orientQ.z},${entry.orientQ.w}")
+        pdc.set(pdcIsMotor,     PersistentDataType.BOOLEAN, entry.isMotor)
+        pdc.set(pdcMotorSpeed,  PersistentDataType.FLOAT, entry.motorSpeed)
+        pdc.set(pdcDisplayUuid, PersistentDataType.STRING, entry.displayUuid.toString())
+        pdc.set(pdcExtraUuids,  PersistentDataType.STRING,
+            entry.extraDisplayUuids.joinToString(","))
+        pdc.set(pdcBX,          PersistentDataType.INTEGER, entry.pos.bx)
+        pdc.set(pdcBY,          PersistentDataType.INTEGER, entry.pos.by)
+        pdc.set(pdcBZ,          PersistentDataType.INTEGER, entry.pos.bz)
+        pdc.set(pdcWorldName,   PersistentDataType.STRING, entry.pos.worldName)
+    }
+
+    fun restoreFromWorld() {
+        var count = 0
+        for (world in plugin.server.worlds) {
+            for (entity in world.entities) {
+                val interaction = entity as? Interaction ?: continue
+                val pdc = interaction.persistentDataContainer
+                val gearTypeName = pdc.get(pdcGearType, PersistentDataType.STRING) ?: continue
+
+                runCatching {
+                    val gearType   = GearType.valueOf(gearTypeName)
+                    val axis       = AxleAxis.valueOf(pdc.get(pdcAxis, PersistentDataType.STRING)!!)
+                    val parts      = pdc.get(pdcOrientQ, PersistentDataType.STRING)!!.split(",")
+                    val orientQ    = Quaternionf(parts[0].toFloat(), parts[1].toFloat(),
+                                                 parts[2].toFloat(), parts[3].toFloat())
+                    val isMotor    = pdc.get(pdcIsMotor, PersistentDataType.BOOLEAN) ?: false
+                    val motorSpeed = pdc.get(pdcMotorSpeed, PersistentDataType.FLOAT) ?: 0f
+                    val displayId  = UUID.fromString(pdc.get(pdcDisplayUuid, PersistentDataType.STRING)!!)
+                    val extraStr   = pdc.get(pdcExtraUuids, PersistentDataType.STRING) ?: ""
+                    val extraUuids = if (extraStr.isEmpty()) mutableListOf()
+                                     else extraStr.split(",").map { UUID.fromString(it.trim()) }.toMutableList()
+                    val bx         = pdc.get(pdcBX, PersistentDataType.INTEGER)!!
+                    val by         = pdc.get(pdcBY, PersistentDataType.INTEGER)!!
+                    val bz         = pdc.get(pdcBZ, PersistentDataType.INTEGER)!!
+                    val worldName  = pdc.get(pdcWorldName, PersistentDataType.STRING)!!
+
+                    // Make sure the display entity is still loaded
+                    val display = plugin.server.getEntity(displayId) as? ItemDisplay
+                        ?: run { interaction.remove(); return@runCatching }
+
+                    val pos = AxlePos(worldName, bx, by, bz)
+                    if (gearsByPos.containsKey(pos)) return@runCatching  // already restored
+
+                    val entry = GearEntry(
+                        displayUuid      = displayId,
+                        interactionUuid  = interaction.uniqueId,
+                        pos              = pos,
+                        axis             = axis,
+                        gearType         = gearType,
+                        orientQ          = orientQ,
+                        translation      = display.transformation.translation,
+                        isMotor          = isMotor,
+                        motorSpeed       = motorSpeed,
+                        extraDisplayUuids = extraUuids
+                    )
+
+                    gearsByPos[pos] = entry
+                    interactionToPos[interaction.uniqueId] = pos
+                    connectGear(entry)
+                    count++
+                }.onFailure { e ->
+                    plugin.logger.warning("Failed to restore gear at ${interaction.location}: ${e.message}")
+                }
+            }
+        }
+        if (count > 0) plugin.logger.info("Restored $count gear(s) from world.")
     }
 
     // ─── Water wheel ─────────────────────────────────────────────────────────
