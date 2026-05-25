@@ -1,3 +1,6 @@
+# Kotlin compiler sessions
+.kotlin/
+
 # Gradle
 .gradle/
 build/
