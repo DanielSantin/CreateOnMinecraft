@@ -1,9 +1,5 @@
 package dev.createonmc
 
-import dev.createonmc.commands.CGearCommand
-import dev.createonmc.commands.CMotorCommand
-import dev.createonmc.commands.CSpeedCommand
-import dev.createonmc.commands.CTestCommand
 import dev.createonmc.commands.SSGGiveCommand
 import dev.createonmc.gear.GearManager
 import dev.createonmc.listeners.AxleInteractListener
@@ -17,11 +13,9 @@ class CreateOnMinecraftPlugin : JavaPlugin() {
     override fun onEnable() {
         gearManager = GearManager(this)
         server.pluginManager.registerEvents(AxleInteractListener(this, gearManager), this)
-        getCommand("ctest")?.setExecutor(CTestCommand(this))
-        getCommand("cspeed")?.setExecutor(CSpeedCommand(gearManager))
-        getCommand("cmotor")?.setExecutor(CMotorCommand())
-        getCommand("cgear")?.setExecutor(CGearCommand())
-        getCommand("ssggive")?.setExecutor(SSGGiveCommand())
+        val ssgGive = SSGGiveCommand()
+        getCommand("ssggive")?.setExecutor(ssgGive)
+        getCommand("ssggive")?.tabCompleter = ssgGive
         logger.info("CreateOnMinecraft enabled!")
     }
 

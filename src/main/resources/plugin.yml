@@ -7,22 +7,6 @@ author: Demarky
 
 commands:
   ssggive:
-    description: Give a Create item (gear, biggear, eixo, motor)
-    usage: /ssggive <gear|biggear|eixo|motor [rpm]>
+    description: Give a Create item
+    usage: /ssggive <gear|biggear|eixo|motor [rpm]|water_wheel>
     permission: createonmc.ssggive
-  cgear:
-    description: Give a cogwheel, large cogwheel, or axle item
-    usage: /cgear [cogwheel|large|eixo]
-    permission: createonmc.cgear
-  ctest:
-    description: Spawn a creative motor (for testing)
-    usage: /ctest spawn [rpm]
-    permission: createonmc.ctest
-  cmotor:
-    description: Give a creative motor item with the specified RPM
-    usage: /cmotor [rpm]
-    permission: createonmc.cmotor
-  cspeed:
-    description: Set global gear speed
-    usage: /cspeed <rpm>
-    permission: createonmc.cspeed
