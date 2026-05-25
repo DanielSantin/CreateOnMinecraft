@@ -485,11 +485,21 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         return normalized * WATER_WHEEL_RPM * 360f / (20f * 60f)
     }
 
-    /** Water level at (x,y,z): 0–8 for water, 8 if non-water (= "fully downstream" sentinel). */
+    /**
+     * Water level at (x,y,z) for flow-gradient calculation.
+     *   non-water  → 8  (sentinel: "fully downstream / absent")
+     *   falling (8)→ 0  (falling water acts as a local source for horizontal spread)
+     *   source  (0)→ 0
+     *   flowing 1–7→ as-is
+     *
+     * Without this, a falling-water neighbor is indistinguishable from dry air,
+     * which inverts the gradient and reverses the detected flow direction.
+     */
     private fun wLvl(world: World, x: Int, y: Int, z: Int): Int {
         val b = world.getBlockAt(x, y, z)
         if (b.type != Material.WATER) return 8
-        return (b.blockData as? org.bukkit.block.data.Levelled)?.level ?: 8
+        val lvl = (b.blockData as? org.bukkit.block.data.Levelled)?.level ?: 8
+        return if (lvl >= 8) 0 else lvl   // falling water (8) = local source = 0
     }
 
     // ─── Tick ────────────────────────────────────────────────────────────────
