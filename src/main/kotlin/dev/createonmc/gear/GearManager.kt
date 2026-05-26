@@ -821,7 +821,8 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
                 if (ms.addInput(temp)) {
                     item.amount -= 1
                     inv.setItem(i, if (item.amount <= 0) null else item)
-                    hopperState.update()
+                    // No update() here: inventory.setItem() writes directly to the live
+                    // tile entity. Calling update() would overwrite with the stale snapshot.
                     stateChanged = true
                 }
                 break  // one item per hopper per transfer tick
@@ -839,7 +840,8 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
                 val leftover = hopperState.inventory.addItem(candidate)
                 if (leftover.isEmpty()) {
                     ms.takeOneFromOutput()   // mirrors what we peeked
-                    hopperState.update()
+                    // No update() here: inventory.setItem() writes directly to the live
+                    // tile entity. Calling update() would overwrite with the stale snapshot.
                     stateChanged = true
                 }
             }
