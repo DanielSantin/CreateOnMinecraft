@@ -729,12 +729,16 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
 
     private fun tickMillstones() {
         for ((pos, ms) in millstoneData) {
+            val entry = gearsByPos[pos] ?: continue
+
+            // Hopper I/O: every 8 ticks (matches vanilla hopper transfer rate)
+            if (tickCount % 8 == 0) tickMillstoneHoppers(pos, ms, entry)
+
+            // ── Processing (requires network power) ──────────────────────────
             val recipe = ms.currentRecipe ?: continue
             if (ms.inputCount <= 0) continue
             if (ms.outputItems.sumOf { it.amount } >= MillstoneData.MAX_OUTPUT_STACKS * recipe.output.maxStackSize) continue
 
-            // Get network speed for this millstone
-            val entry = gearsByPos[pos] ?: continue
             val network = networks[entry.networkId] ?: continue
             val baseDpt = networkEffectiveDpt(network)
             if (baseDpt == 0f) continue
@@ -750,9 +754,9 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
                 world.spawnParticle(
                     org.bukkit.Particle.ITEM,
                     pLoc,
-                    6,          // count
-                    0.25, 0.15, 0.25,  // spread X/Y/Z
-                    0.08,       // speed
+                    6,
+                    0.25, 0.15, 0.25,
+                    0.08,
                     org.bukkit.inventory.ItemStack(mat)
                 )
             }
@@ -765,14 +769,85 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
                     ms.currentRecipe = null
                     ms.progressTicks = 0
                 }
-                // Add to output
                 val output = ms.outputItems.find { it.type == recipe.output && it.amount < it.maxStackSize }
                 if (output != null) output.amount += recipe.outputCount
                 else ms.outputItems.add(org.bukkit.inventory.ItemStack(recipe.output, recipe.outputCount))
-                // Persist updated state immediately
                 val interaction = plugin.server.getEntity(entry.interactionUuid) as? org.bukkit.entity.Interaction
                 if (interaction != null) tagMillstoneState(interaction, ms)
             }
+        }
+    }
+
+    /**
+     * Transfers items between adjacent hoppers and this millstone.
+     * Called every 8 ticks — matches the vanilla hopper transfer rate (1 item / 8 ticks).
+     *
+     * Input: hoppers pointing TOWARD the millstone (any of the 5 non-bottom faces).
+     *   e.g. hopper above facing DOWN, hopper to the East facing WEST.
+     *
+     * Output: hopper directly BELOW the millstone (pulls from output regardless of spin).
+     *   One item per call; if hopper inventory is full the item is kept in output.
+     *
+     * No watchlist is needed: we already iterate only the set of existing millstones,
+     * so checking their 6 adjacent blocks is O(millstones × 6) — already optimal.
+     */
+    private fun tickMillstoneHoppers(pos: AxlePos, ms: MillstoneData, entry: GearEntry) {
+        val world = plugin.server.getWorld(pos.worldName) ?: return
+        var stateChanged = false
+
+        // ── Input: hoppers whose output nozzle points at this millstone ──────
+        // Each pair: (offset from millstone → hopper position, required facing of that hopper)
+        val inputCandidates = listOf(
+            Triple( 0, 1, 0) to org.bukkit.block.BlockFace.DOWN,   // above  → faces DOWN
+            Triple( 0, 0, 1) to org.bukkit.block.BlockFace.NORTH,  // south  → faces NORTH
+            Triple( 0, 0,-1) to org.bukkit.block.BlockFace.SOUTH,  // north  → faces SOUTH
+            Triple( 1, 0, 0) to org.bukkit.block.BlockFace.WEST,   // east   → faces WEST
+            Triple(-1, 0, 0) to org.bukkit.block.BlockFace.EAST    // west   → faces EAST
+        )
+        for ((offset, requiredFacing) in inputCandidates) {
+            val (dx, dy, dz) = offset
+            val block = world.getBlockAt(pos.bx + dx, pos.by + dy, pos.bz + dz)
+            if (block.type != Material.HOPPER) continue
+            val hopperData = block.blockData as? org.bukkit.block.data.type.Hopper ?: continue
+            if (hopperData.facing != requiredFacing) continue
+
+            val hopperState = block.state as? org.bukkit.block.Hopper ?: continue
+            val inv = hopperState.inventory
+            for (i in 0 until inv.size) {
+                val item = inv.getItem(i) ?: continue
+                if (item.type.isAir) continue
+                // Try to push exactly 1 item
+                val temp = org.bukkit.inventory.ItemStack(item.type, 1)
+                if (ms.addInput(temp)) {
+                    item.amount -= 1
+                    inv.setItem(i, if (item.amount <= 0) null else item)
+                    hopperState.update()
+                    stateChanged = true
+                }
+                break  // one item per hopper per transfer tick
+            }
+        }
+
+        // ── Output: hopper directly below pulls one item from output ─────────
+        val below = world.getBlockAt(pos.bx, pos.by - 1, pos.bz)
+        if (below.type == Material.HOPPER) {
+            val hopperState = below.state as? org.bukkit.block.Hopper
+            if (hopperState != null && ms.outputItems.isNotEmpty()) {
+                // Peek: try to add 1 item — only consume from our output if it fits
+                val peek = ms.outputItems.first()
+                val candidate = org.bukkit.inventory.ItemStack(peek.type, 1)
+                val leftover = hopperState.inventory.addItem(candidate)
+                if (leftover.isEmpty()) {
+                    ms.takeOneFromOutput()   // mirrors what we peeked
+                    hopperState.update()
+                    stateChanged = true
+                }
+            }
+        }
+
+        if (stateChanged) {
+            val interaction = plugin.server.getEntity(entry.interactionUuid) as? org.bukkit.entity.Interaction
+            if (interaction != null) tagMillstoneState(interaction, ms)
         }
     }
 

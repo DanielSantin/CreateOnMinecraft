@@ -38,6 +38,15 @@ class MillstoneData {
         return true
     }
 
+    /** Take exactly one item from output (for hopper extraction). Returns null if empty. */
+    fun takeOneFromOutput(): ItemStack? {
+        val first = outputItems.firstOrNull() ?: return null
+        val result = first.clone().also { it.amount = 1 }
+        first.amount -= 1
+        if (first.amount <= 0) outputItems.removeFirst()
+        return result
+    }
+
     /** Take up to one stack from output. Returns the ItemStack or null. */
     fun takeOutput(): ItemStack? {
         if (outputItems.isEmpty()) return null
