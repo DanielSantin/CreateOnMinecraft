@@ -722,10 +722,15 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
                 val entry = gearsByPos[pos] ?: continue
                 val display = plugin.server.getEntity(entry.displayUuid) as? ItemDisplay ?: continue
                 val t = display.transformation
+                val newQ = computeTotalQ(entry.orientQ, net.angle * entry.speedMultiplier)
+                // Quaternions q and −q represent the same rotation, but the client
+                // interpolates numerically along the shortest arc. If the new quaternion
+                // is in the opposite hemisphere (dot < 0), negate it so the client
+                // always takes the short path and never produces a 180° flip.
+                val safeQ = if (t.leftRotation.dot(newQ) < 0f)
+                    Quaternionf(-newQ.x, -newQ.y, -newQ.z, -newQ.w) else newQ
                 display.transformation = Transformation(
-                    entry.translation,
-                    computeTotalQ(entry.orientQ, net.angle * entry.speedMultiplier),
-                    t.scale, t.rightRotation
+                    entry.translation, safeQ, t.scale, t.rightRotation
                 )
                 display.interpolationDuration = stepTicks
                 display.interpolationDelay = 0
