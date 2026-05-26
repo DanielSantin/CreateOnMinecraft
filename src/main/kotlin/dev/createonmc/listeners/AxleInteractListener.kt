@@ -100,9 +100,15 @@ class AxleInteractListener(
         val gearType = heldGearType(player) ?: GearType.COGWHEEL
         val (isMotor, rpm) = motorParams(gearType, player)
 
+        // MILLSTONE is always placed flat (Y-axis), regardless of the clicked gear's axis
+        val (orientQ, axis) = if (gearType == GearType.MILLSTONE)
+            AxleUtil.orientFromFace(org.bukkit.block.BlockFace.UP)
+        else
+            entry.orientQ to entry.axis
+
         gearManager.spawnGear(
             player.world, pos.bx + dx, pos.by + dy, pos.bz + dz,
-            entry.orientQ, entry.axis, gearType = gearType, isMotor = isMotor, rpm = rpm
+            orientQ, axis, gearType = gearType, isMotor = isMotor, rpm = rpm
         )
     }
 
