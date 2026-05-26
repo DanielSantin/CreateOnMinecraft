@@ -30,7 +30,8 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
 
     // Barrier block offsets relative to gear position, per gear type (generic collision shapes)
     private val colliderOffsets: Map<GearType, List<Triple<Int,Int,Int>>> = mapOf(
-        GearType.WATER_WHEEL to listOf(Triple(0, 0, 0))
+        GearType.WATER_WHEEL to listOf(Triple(0, 0, 0)),
+        GearType.MILLSTONE   to listOf(Triple(0, 0, 0))
     )
 
     private val gearsByPos = mutableMapOf<AxlePos, GearEntry>()
@@ -191,6 +192,11 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
     fun getPosForInteraction(uuid: UUID): AxlePos? = interactionToPos[uuid]
 
     fun getEntry(pos: AxlePos): GearEntry? = gearsByPos[pos]
+
+    fun getInteractionEntity(pos: AxlePos): org.bukkit.entity.Interaction? {
+        val entry = gearsByPos[pos] ?: return null
+        return plugin.server.getEntity(entry.interactionUuid) as? org.bukkit.entity.Interaction
+    }
 
     // ─── Network logic ───────────────────────────────────────────────────────
 
@@ -918,8 +924,9 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
     private fun interactionDimensions(axis: AxleAxis, gearType: GearType): Pair<Float, Float> {
         // Water wheel: barrier block handles all collision; Interaction entity is kept only
         // for UUID mapping — give it a negligible hitbox so it never intercepts block clicks.
-        if (gearType == GearType.WATER_WHEEL) return Pair(0.01f, 0.01f)
-        if (gearType == GearType.MILLSTONE)  return Pair(1.5f, 0.8f)
+        // Water wheel and millstone use barrier blocks for collision;
+        // the Interaction entity is kept only for UUID mapping — negligible hitbox.
+        if (gearType == GearType.WATER_WHEEL || gearType == GearType.MILLSTONE) return Pair(0.01f, 0.01f)
         val radialSize = when (gearType) {
             GearType.LARGE_COGWHEEL -> 1.8f
             GearType.AXLE           -> 0.5f

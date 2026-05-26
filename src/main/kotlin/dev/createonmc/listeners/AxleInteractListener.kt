@@ -35,8 +35,21 @@ class AxleInteractListener(
         if (event.action != Action.RIGHT_CLICK_BLOCK) return
         if (event.hand != org.bukkit.inventory.EquipmentSlot.HAND) return
         val player = event.player
-        if (player.inventory.itemInMainHand.type != Material.STICK) return
         val block = event.clickedBlock ?: return
+
+        // ── Right-click on barrier → check if it belongs to a millstone ──────
+        if (block.type == Material.BARRIER) {
+            val pos = dev.createonmc.axle.AxlePos(block.world.name, block.x, block.y, block.z)
+            val entry = gearManager.getEntry(pos)
+            if (entry?.gearType == GearType.MILLSTONE) {
+                event.isCancelled = true
+                val interaction = gearManager.getInteractionEntity(pos)
+                if (interaction != null) handleMillstoneInteract(player, pos, interaction)
+                return
+            }
+        }
+
+        if (player.inventory.itemInMainHand.type != Material.STICK) return
 
         val gearType = heldGearType(player) ?: return
 
