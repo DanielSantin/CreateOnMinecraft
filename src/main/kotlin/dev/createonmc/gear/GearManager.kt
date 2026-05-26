@@ -741,6 +741,22 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
             val rpm = baseDpt * entry.speedMultiplier * (20f * 60f) / 360f
 
             ms.progressTicks += ms.processingSpeed(rpm)
+
+            // Particle: spray item fragments while processing (every 4 ticks)
+            if (tickCount % 4 == 0) {
+                val mat = ms.inputItem ?: continue
+                val world = plugin.server.getWorld(pos.worldName) ?: continue
+                val pLoc = Location(world, pos.bx + 0.5, pos.by + 0.6, pos.bz + 0.5)
+                world.spawnParticle(
+                    org.bukkit.Particle.ITEM,
+                    pLoc,
+                    6,          // count
+                    0.25, 0.15, 0.25,  // spread X/Y/Z
+                    0.08,       // speed
+                    org.bukkit.inventory.ItemStack(mat)
+                )
+            }
+
             if (ms.progressTicks >= recipe.processingTime) {
                 ms.progressTicks -= recipe.processingTime
                 ms.inputCount -= 1
