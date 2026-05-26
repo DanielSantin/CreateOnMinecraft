@@ -14,7 +14,7 @@ class SSGGiveCommand : CommandExecutor, TabCompleter {
 
     private val rpmKey = NamespacedKey("createonmc", "motor_rpm")
 
-    private val items = listOf("gear", "biggear", "eixo", "motor", "water_wheel")
+    private val items = listOf("gear", "biggear", "eixo", "motor", "water_wheel", "millstone")
 
     override fun onCommand(sender: CommandSender, command: Command, label: String, args: Array<String>): Boolean {
         if (sender !is Player) { sender.sendMessage("Only players can use this command."); return true }
@@ -30,6 +30,7 @@ class SSGGiveCommand : CommandExecutor, TabCompleter {
             "biggear"     -> makeItem("biggear", "Big Gear")
             "eixo"        -> makeItem("eixo", "Eixo")
             "water_wheel" -> makeItem("water_wheel", "Water Wheel")
+            "millstone"   -> makeItem("millstone", "Millstone")
             "motor" -> {
                 val rpm = args.getOrNull(1)?.toFloatOrNull() ?: 10f
                 if (rpm == 0f) { sender.sendMessage("RPM cannot be 0."); return true }

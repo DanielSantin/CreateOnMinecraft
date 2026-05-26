@@ -36,6 +36,7 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
     private val gearsByPos = mutableMapOf<AxlePos, GearEntry>()
     private val interactionToPos = mutableMapOf<UUID, AxlePos>()
     val networks = mutableMapOf<Int, GearNetwork>()
+    val millstoneData = mutableMapOf<AxlePos, MillstoneData>()
     private var nextNetworkId = 0
     private var tickCount = 0
 
@@ -51,6 +52,11 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
     private val pdcBY          = NamespacedKey(plugin, "by")
     private val pdcBZ          = NamespacedKey(plugin, "bz")
     private val pdcWorldName   = NamespacedKey(plugin, "world_name")
+    // Millstone inventory PDC keys
+    private val pdcMsInputType  = NamespacedKey(plugin, "ms_input_type")
+    private val pdcMsInputCount = NamespacedKey(plugin, "ms_input_count")
+    private val pdcMsOutput     = NamespacedKey(plugin, "ms_output")      // "MAT:n,MAT:n,..."
+    private val pdcMsProgress   = NamespacedKey(plugin, "ms_progress")
 
     init {
         plugin.server.scheduler.runTaskTimer(plugin, Runnable { tick() }, 0L, 1L)
@@ -89,18 +95,25 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         }
         display.setItemStack(gearItem(gearType))
 
-        // Spawn extra static display (e.g. water_wheel-fixo) for types that need it
+        // Spawn extra static display for types that need it
         val extraUuids = mutableListOf<UUID>()
-        if (gearType == GearType.WATER_WHEEL) {
-            val fixo = world.spawn(loc, ItemDisplay::class.java) { entity ->
-                entity.itemDisplayTransform = ItemDisplay.ItemDisplayTransform.NONE
-                entity.interpolationDuration = 0
-                entity.interpolationDelay = 0
-                entity.transformation = Transformation(translation, computeTotalQ(orientQ, 0f),
-                    Vector3f(SCALE), Quaternionf(0f, 0f, 0f, 1f))
+        if (gearType == GearType.WATER_WHEEL || gearType == GearType.MILLSTONE) {
+            val staticItem = when (gearType) {
+                GearType.WATER_WHEEL -> waterWheelFixoItem()
+                GearType.MILLSTONE   -> millstoneFixedItem()
+                else -> null
             }
-            fixo.setItemStack(waterWheelFixoItem())
-            extraUuids.add(fixo.uniqueId)
+            if (staticItem != null) {
+                val fixo = world.spawn(loc, ItemDisplay::class.java) { entity ->
+                    entity.itemDisplayTransform = ItemDisplay.ItemDisplayTransform.NONE
+                    entity.interpolationDuration = 0
+                    entity.interpolationDelay = 0
+                    entity.transformation = Transformation(translation, computeTotalQ(orientQ, 0f),
+                        Vector3f(SCALE), Quaternionf(0f, 0f, 0f, 1f))
+                }
+                fixo.setItemStack(staticItem)
+                extraUuids.add(fixo.uniqueId)
+            }
         }
 
         // Place barrier blocks for physical collision
@@ -131,6 +144,7 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         gearsByPos[pos] = entry
         interactionToPos[interaction.uniqueId] = pos
         tagInteraction(interaction, entry)
+        if (gearType == GearType.MILLSTONE) millstoneData[pos] = MillstoneData()
 
         if (!connectGear(entry)) return false
 
@@ -153,6 +167,12 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         plugin.server.getEntity(entry.interactionUuid)?.remove()
         entry.extraDisplayUuids.forEach { plugin.server.getEntity(it)?.remove() }
         removeColliders(world, bx, by, bz, entry.gearType)
+        // Drop remaining millstone inventory items on removal
+        millstoneData.remove(pos)?.let { ms ->
+            val dropLoc = Location(world, bx + 0.5, by + 0.8, bz + 0.5)
+            ms.inputItem?.let { mat -> if (ms.inputCount > 0) world.dropItemNaturally(dropLoc, org.bukkit.inventory.ItemStack(mat, ms.inputCount)) }
+            ms.outputItems.forEach { world.dropItemNaturally(dropLoc, it) }
+        }
         if (dropItem) gearDropItem(entry.gearType)?.let {
             world.dropItemNaturally(Location(world, bx + 0.5, by + 0.8, bz + 0.5), it)
         }
@@ -257,11 +277,16 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
 
     // Returns the speed ratio of `myType` relative to `neighborType` for a lateral (meshing) connection.
     // Sign is always negative (opposite rotation). Magnitude is the gear ratio.
-    private fun lateralRatio(myType: GearType, neighborType: GearType): Float = when {
-        myType == GearType.COGWHEEL      && neighborType == GearType.COGWHEEL      -> -1.0f
-        myType == GearType.LARGE_COGWHEEL && neighborType == GearType.LARGE_COGWHEEL -> -1.0f
-        myType == GearType.COGWHEEL      && neighborType == GearType.LARGE_COGWHEEL -> -2.0f
-        else -> -0.5f  // LARGE_COGWHEEL meshing with COGWHEEL
+    // MILLSTONE is treated as COGWHEEL for ratio purposes (same tooth-ring size)
+    private fun lateralRatio(myType: GearType, neighborType: GearType): Float {
+        val my = if (myType == GearType.MILLSTONE) GearType.COGWHEEL else myType
+        val nb = if (neighborType == GearType.MILLSTONE) GearType.COGWHEEL else neighborType
+        return when {
+            my == GearType.COGWHEEL       && nb == GearType.COGWHEEL       -> -1.0f
+            my == GearType.LARGE_COGWHEEL && nb == GearType.LARGE_COGWHEEL -> -1.0f
+            my == GearType.COGWHEEL       && nb == GearType.LARGE_COGWHEEL -> -2.0f
+            else                                                            -> -0.5f
+        }
     }
 
     private fun rebuildNetworks(oldId: Int) {
@@ -342,17 +367,22 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
     }
 
     private fun canMeshLaterally(type: GearType) =
-        type == GearType.COGWHEEL || type == GearType.LARGE_COGWHEEL
+        type == GearType.COGWHEEL || type == GearType.LARGE_COGWHEEL || type == GearType.MILLSTONE
 
     private fun findNeighborConnections(pos: AxlePos, axis: AxleAxis, gearType: GearType): List<Pair<AxlePos, Boolean>> {
         val result = mutableListOf<Pair<AxlePos, Boolean>>()
         val (ax, ay, az) = axis.positiveOffset()
-        for (f in listOf(1, -1)) {
-            val n = AxlePos(pos.worldName, pos.bx + ax * f, pos.by + ay * f, pos.bz + az * f)
-            if (gearsByPos[n]?.axis == axis) result.add(n to true)
+        // MILLSTONE only connects laterally, never via the axle direction
+        if (gearType != GearType.MILLSTONE) {
+            for (f in listOf(1, -1)) {
+                val n = AxlePos(pos.worldName, pos.bx + ax * f, pos.by + ay * f, pos.bz + az * f)
+                val neighbor = gearsByPos[n] ?: continue
+                if (neighbor.axis == axis && neighbor.gearType != GearType.MILLSTONE)
+                    result.add(n to true)
+            }
         }
         if (canMeshLaterally(gearType)) {
-            for (neighborType in listOf(GearType.COGWHEEL, GearType.LARGE_COGWHEEL)) {
+            for (neighborType in listOf(GearType.COGWHEEL, GearType.LARGE_COGWHEEL, GearType.MILLSTONE)) {
                 for ((dx, dy, dz) in meshingOffsets(axis, gearType, neighborType)) {
                     val n = AxlePos(pos.worldName, pos.bx + dx, pos.by + dy, pos.bz + dz)
                     val neighbor = gearsByPos[n] ?: continue
@@ -386,11 +416,16 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         AxleAxis.Z -> listOf(Triple(1,1,0), Triple(1,-1,0), Triple(-1,1,0), Triple(-1,-1,0))
     }
 
-    private fun meshingOffsets(axis: AxleAxis, myType: GearType, neighborType: GearType) = when {
-        myType == GearType.COGWHEEL       && neighborType == GearType.COGWHEEL       -> perpendicularOffsets(axis)
-        myType == GearType.COGWHEEL       && neighborType == GearType.LARGE_COGWHEEL -> diagonalOffsets(axis)
-        myType == GearType.LARGE_COGWHEEL && neighborType == GearType.COGWHEEL       -> diagonalOffsets(axis)
-        else -> emptyList<Triple<Int,Int,Int>>()  // LARGE-LARGE don't mesh in the same plane, only via bevel
+    private fun meshingOffsets(axis: AxleAxis, myType: GearType, neighborType: GearType): List<Triple<Int,Int,Int>> {
+        // Treat MILLSTONE as COGWHEEL for meshing offset calculation
+        val my = if (myType == GearType.MILLSTONE) GearType.COGWHEEL else myType
+        val nb = if (neighborType == GearType.MILLSTONE) GearType.COGWHEEL else neighborType
+        return when {
+            my == GearType.COGWHEEL       && nb == GearType.COGWHEEL       -> perpendicularOffsets(axis)
+            my == GearType.COGWHEEL       && nb == GearType.LARGE_COGWHEEL -> diagonalOffsets(axis)
+            my == GearType.LARGE_COGWHEEL && nb == GearType.COGWHEEL       -> diagonalOffsets(axis)
+            else -> emptyList()
+        }
     }
 
     // Bevel candidates: each entry is (offset → expected neighbor axis) for cross-axis LARGE_COGWHEEL meshing
@@ -451,6 +486,15 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
 
     // ─── Persistence ─────────────────────────────────────────────────────────
 
+    fun tagMillstoneState(interaction: Interaction, ms: MillstoneData) {
+        val pdc = interaction.persistentDataContainer
+        pdc.set(pdcMsInputType,  PersistentDataType.STRING, ms.inputItem?.name ?: "")
+        pdc.set(pdcMsInputCount, PersistentDataType.INTEGER, ms.inputCount)
+        pdc.set(pdcMsProgress,   PersistentDataType.INTEGER, ms.progressTicks)
+        val outputStr = ms.outputItems.joinToString(",") { "${it.type.name}:${it.amount}" }
+        pdc.set(pdcMsOutput, PersistentDataType.STRING, outputStr)
+    }
+
     private fun tagInteraction(interaction: Interaction, entry: GearEntry) {
         val pdc = interaction.persistentDataContainer
         pdc.set(pdcGearType,    PersistentDataType.STRING, entry.gearType.name)
@@ -466,6 +510,10 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         pdc.set(pdcBY,          PersistentDataType.INTEGER, entry.pos.by)
         pdc.set(pdcBZ,          PersistentDataType.INTEGER, entry.pos.bz)
         pdc.set(pdcWorldName,   PersistentDataType.STRING, entry.pos.worldName)
+        // Write blank millstone state for new spawns so the keys exist for restore
+        if (entry.gearType == GearType.MILLSTONE) {
+            tagMillstoneState(interaction, millstoneData[entry.pos] ?: MillstoneData())
+        }
     }
 
     /** Tenta restaurar uma única entidade Interaction a partir do seu PDC. */
@@ -512,6 +560,28 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
             gearsByPos[pos] = entry
             interactionToPos[interaction.uniqueId] = pos
             connectGear(entry)
+
+            if (gearType == GearType.MILLSTONE) {
+                val ms = MillstoneData()
+                val inputTypeName = pdc.get(pdcMsInputType, PersistentDataType.STRING) ?: ""
+                if (inputTypeName.isNotEmpty()) {
+                    runCatching { ms.inputItem = Material.valueOf(inputTypeName) }
+                }
+                ms.inputCount = pdc.get(pdcMsInputCount, PersistentDataType.INTEGER) ?: 0
+                ms.progressTicks = pdc.get(pdcMsProgress, PersistentDataType.INTEGER) ?: 0
+                if (ms.inputItem != null) ms.currentRecipe = MillstoneRecipes.find(ms.inputItem!!)
+                val outputStr = pdc.get(pdcMsOutput, PersistentDataType.STRING) ?: ""
+                if (outputStr.isNotEmpty()) {
+                    outputStr.split(",").forEach { token ->
+                        val parts2 = token.split(":")
+                        if (parts2.size == 2) runCatching {
+                            ms.outputItems.add(org.bukkit.inventory.ItemStack(
+                                Material.valueOf(parts2[0]), parts2[1].toInt()))
+                        }
+                    }
+                }
+                millstoneData[pos] = ms
+            }
         }.onFailure { e ->
             plugin.logger.warning("Failed to restore gear at ${interaction.location}: ${e.message}")
             return false
@@ -611,6 +681,7 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
     private fun tick() {
         tickCount++
         if (tickCount % 20 == 0) updateWaterWheelSpeeds()
+        tickMillstones()
 
         val dead = mutableListOf<AxlePos>()
         for ((_, entry) in gearsByPos) {
@@ -621,6 +692,7 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
             val e = gearsByPos.remove(pos) ?: return@forEach
             interactionToPos.remove(e.interactionUuid)
             e.extraDisplayUuids.forEach { plugin.server.getEntity(it)?.remove() }
+            millstoneData.remove(pos)
             plugin.server.getWorld(pos.worldName)?.let { w ->
                 removeColliders(w, pos.bx, pos.by, pos.bz, e.gearType)
             }
@@ -655,6 +727,39 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         }
     }
 
+    private fun tickMillstones() {
+        for ((pos, ms) in millstoneData) {
+            val recipe = ms.currentRecipe ?: continue
+            if (ms.inputCount <= 0) continue
+            if (ms.outputItems.sumOf { it.amount } >= MillstoneData.MAX_OUTPUT_STACKS * recipe.output.maxStackSize) continue
+
+            // Get network speed for this millstone
+            val entry = gearsByPos[pos] ?: continue
+            val network = networks[entry.networkId] ?: continue
+            val baseDpt = networkEffectiveDpt(network)
+            if (baseDpt == 0f) continue
+            val rpm = baseDpt * entry.speedMultiplier * (20f * 60f) / 360f
+
+            ms.progressTicks += ms.processingSpeed(rpm)
+            if (ms.progressTicks >= recipe.processingTime) {
+                ms.progressTicks -= recipe.processingTime
+                ms.inputCount -= 1
+                if (ms.inputCount <= 0) {
+                    ms.inputItem = null
+                    ms.currentRecipe = null
+                    ms.progressTicks = 0
+                }
+                // Add to output
+                val output = ms.outputItems.find { it.type == recipe.output && it.amount < it.maxStackSize }
+                if (output != null) output.amount += recipe.outputCount
+                else ms.outputItems.add(org.bukkit.inventory.ItemStack(recipe.output, recipe.outputCount))
+                // Persist updated state immediately
+                val interaction = plugin.server.getEntity(entry.interactionUuid) as? org.bukkit.entity.Interaction
+                if (interaction != null) tagMillstoneState(interaction, ms)
+            }
+        }
+    }
+
     private fun computeTotalQ(orientQ: Quaternionf, angle: Float): Quaternionf =
         Quaternionf(orientQ).mul(RotationUtil.axisAngle(0f, 1f, 0f, angle))
 
@@ -665,10 +770,19 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
             GearType.AXLE           -> NamespacedKey("ssggearmachine", "eixo")
             GearType.MOTOR          -> NamespacedKey("ssggearmachine", "motor")
             GearType.WATER_WHEEL    -> NamespacedKey("ssggearmachine", "parts/water_wheel_spin")
+            GearType.MILLSTONE      -> NamespacedKey("ssggearmachine", "parts/millstone_spin")
         }
         val stack = ItemStack(Material.STICK)
         val meta: ItemMeta = stack.itemMeta ?: return stack
         meta.setItemModel(modelKey)
+        stack.itemMeta = meta
+        return stack
+    }
+
+    private fun millstoneFixedItem(): ItemStack {
+        val stack = ItemStack(Material.STICK)
+        val meta: ItemMeta = stack.itemMeta ?: return stack
+        meta.setItemModel(NamespacedKey("ssggearmachine", "parts/millstone_fixed"))
         stack.itemMeta = meta
         return stack
     }
@@ -682,11 +796,15 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
     }
 
     private fun gearDropItem(type: GearType): ItemStack? {
-        if (type != GearType.WATER_WHEEL) return null
+        val (modelId, displayName) = when (type) {
+            GearType.WATER_WHEEL -> "water_wheel" to "Water Wheel"
+            GearType.MILLSTONE   -> "millstone" to "Millstone"
+            else -> return null
+        }
         val stack = ItemStack(Material.STICK)
         val meta: ItemMeta = stack.itemMeta ?: return null
-        meta.setItemModel(NamespacedKey("ssggearmachine", "water_wheel"))
-        meta.setDisplayName("§rWater Wheel")
+        meta.setItemModel(NamespacedKey("ssggearmachine", modelId))
+        meta.setDisplayName("§r$displayName")
         stack.itemMeta = meta
         return stack
     }
@@ -708,6 +826,7 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         // Water wheel: barrier block handles all collision; Interaction entity is kept only
         // for UUID mapping — give it a negligible hitbox so it never intercepts block clicks.
         if (gearType == GearType.WATER_WHEEL) return Pair(0.01f, 0.01f)
+        if (gearType == GearType.MILLSTONE)  return Pair(1.5f, 0.8f)
         val radialSize = when (gearType) {
             GearType.LARGE_COGWHEEL -> 1.8f
             GearType.AXLE           -> 0.5f

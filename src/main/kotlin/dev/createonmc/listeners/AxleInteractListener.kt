@@ -2,6 +2,7 @@ package dev.createonmc.listeners
 
 import dev.createonmc.axle.AxleAxis
 import dev.createonmc.gear.GearManager
+import dev.createonmc.gear.MillstoneData
 import dev.createonmc.gear.GearType
 import dev.createonmc.util.AxleUtil
 import org.bukkit.Material
@@ -49,7 +50,11 @@ class AxleInteractListener(
         event.isCancelled = true
 
         val target = block.getRelative(event.blockFace)
-        val (orientQ, axis) = AxleUtil.orientFromFace(event.blockFace)
+        // MILLSTONE is always placed flat (Y-axis), regardless of clicked face
+        val (orientQ, axis) = if (gearType == GearType.MILLSTONE)
+            AxleUtil.orientFromFace(org.bukkit.block.BlockFace.UP)
+        else
+            AxleUtil.orientFromFace(event.blockFace)
         val (isMotor, rpm) = motorParams(gearType, player)
 
         gearManager.spawnGear(player.world, target.x, target.y, target.z, orientQ, axis,
@@ -59,23 +64,73 @@ class AxleInteractListener(
     @EventHandler
     fun onRightClickGear(event: PlayerInteractEntityEvent) {
         val player = event.player
-        if (player.inventory.itemInMainHand.type != Material.STICK) return
         val interaction = event.rightClicked as? Interaction ?: return
         val pos = gearManager.getPosForInteraction(interaction.uniqueId) ?: return
         val entry = gearManager.getEntry(pos) ?: return
         event.isCancelled = true
 
+        // ── Millstone inventory interaction ──────────────────────────────────
+        if (entry.gearType == GearType.MILLSTONE) {
+            handleMillstoneInteract(player, pos, interaction)
+            return
+        }
+
+        // ── Gear placement on adjacent face ──────────────────────────────────
+        if (player.inventory.itemInMainHand.type != Material.STICK) return
+
         val face = rayHitFace(player.eyeLocation.toVector(), player.location.direction,
                               pos.bx, pos.by, pos.bz) ?: return
         val (dx, dy, dz) = faceOffset(face)
 
-        val gearType = heldGearType(player)
+        val gearType = heldGearType(player) ?: GearType.COGWHEEL
         val (isMotor, rpm) = motorParams(gearType, player)
 
         gearManager.spawnGear(
             player.world, pos.bx + dx, pos.by + dy, pos.bz + dz,
             entry.orientQ, entry.axis, gearType = gearType, isMotor = isMotor, rpm = rpm
         )
+    }
+
+    private fun handleMillstoneInteract(player: org.bukkit.entity.Player, pos: dev.createonmc.axle.AxlePos, interaction: Interaction) {
+        val ms = gearManager.millstoneData[pos] ?: return
+        val held = player.inventory.itemInMainHand.clone()
+
+        if (held.type != Material.AIR && !held.type.isAir) {
+            // Right-click with item → try to add to input
+            val original = player.inventory.itemInMainHand
+            val added = ms.addInput(original)
+            if (added) {
+                if (original.amount <= 0) player.inventory.setItemInMainHand(org.bukkit.inventory.ItemStack(Material.AIR))
+                val recipe = ms.currentRecipe
+                val msg = if (recipe != null)
+                    "§7[Millstone] Input: §f${ms.inputCount}x ${ms.inputItem?.name} §7→ §f${recipe.output.name}"
+                else "§c[Millstone] No recipe for ${held.type.name}."  // shouldn't reach here
+                player.sendMessage(msg)
+            } else {
+                val reason = when {
+                    ms.inputItem != null && ms.inputItem != held.type -> "§c[Millstone] Already processing ${ms.inputItem?.name}."
+                    ms.inputCount >= MillstoneData.MAX_INPUT           -> "§c[Millstone] Input full."
+                    else                                               -> "§c[Millstone] No recipe for ${held.type.name}."
+                }
+                player.sendMessage(reason)
+            }
+        } else {
+            // Empty hand → take output first, then input
+            val taken = ms.takeOutput() ?: ms.takeInput()
+            if (taken != null) {
+                player.inventory.addItem(taken).values.forEach { overflow ->
+                    player.world.dropItemNaturally(player.location, overflow)
+                }
+                player.sendMessage("§7[Millstone] Took §f${taken.amount}x ${taken.type.name}.")
+            } else {
+                val inputInfo = if (ms.inputItem != null) "§7Input: §f${ms.inputCount}x ${ms.inputItem?.name}" else "§7Input: §fempty"
+                val recipe = ms.currentRecipe
+                val progressInfo = if (recipe != null) " §7(${ms.progressTicks}/${recipe.processingTime})" else ""
+                player.sendMessage("§7[Millstone] Empty. $inputInfo$progressInfo")
+            }
+        }
+        // Persist updated state
+        gearManager.tagMillstoneState(interaction, ms)
     }
 
     @EventHandler
@@ -126,14 +181,16 @@ class AxleInteractListener(
         }
     }
 
-    private fun heldGearType(player: Player): GearType {
+    private fun heldGearType(player: Player): GearType? {
         val model = player.inventory.itemInMainHand.itemMeta?.itemModel
         return when (model) {
-            NamespacedKey("ssggearmachine", "biggear")        -> GearType.LARGE_COGWHEEL
-            NamespacedKey("ssggearmachine", "eixo")           -> GearType.AXLE
-            NamespacedKey("ssggearmachine", "motor")          -> GearType.MOTOR
-            NamespacedKey("ssggearmachine", "water_wheel")     -> GearType.WATER_WHEEL
-            else                                               -> GearType.COGWHEEL
+            NamespacedKey("ssggearmachine", "gear")        -> GearType.COGWHEEL
+            NamespacedKey("ssggearmachine", "biggear")     -> GearType.LARGE_COGWHEEL
+            NamespacedKey("ssggearmachine", "eixo")        -> GearType.AXLE
+            NamespacedKey("ssggearmachine", "motor")       -> GearType.MOTOR
+            NamespacedKey("ssggearmachine", "water_wheel") -> GearType.WATER_WHEEL
+            NamespacedKey("ssggearmachine", "millstone")   -> GearType.MILLSTONE
+            else                                           -> null
         }
     }
 
