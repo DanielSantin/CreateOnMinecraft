@@ -157,11 +157,13 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         if (!connectGear(entry)) return false
 
         val net = networks[entry.networkId]
-        val initialQ = if (net != null && net.motorPositions.isNotEmpty()) {
-            computeTotalQ(entry.orientQ, net.angle * entry.speedMultiplier)
-        } else {
-            computeTotalQ(entry.orientQ, 0f)
-        }
+        val baseAngle = if (net != null && net.motorPositions.isNotEmpty())
+            net.angle * entry.speedMultiplier else 0f
+        // Mesh offset: shift by half a tooth pitch so teeth interlock instead of collide.
+        // This offset is constant (independent of net.angle) — proved by the meshing
+        // invariant θ_A + θ_B = const, where the ±speedMultiplier terms cancel.
+        val meshOffset = computeMeshOffset(entry)
+        val initialQ = computeTotalQ(entry.orientQ, baseAngle + meshOffset)
         entry.currentDisplayQ = Quaternionf(initialQ)
         (plugin.server.getEntity(entry.displayUuid) as? ItemDisplay)?.transformation =
             Transformation(entry.translation, initialQ, Vector3f(SCALE), Quaternionf(0f, 0f, 0f, 1f))
@@ -916,6 +918,33 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
             val interaction = plugin.server.getEntity(entry.interactionUuid) as? org.bukkit.entity.Interaction
             if (interaction != null) tagMillstoneState(interaction, ms)
         }
+    }
+
+    /**
+     * Half-tooth-pitch offset for the newly placed [entry] based on its first lateral
+     * (non-axial) connection. This aligns the placed gear's teeth into the gaps of its
+     * neighbour instead of colliding.
+     *
+     * Tooth counts:  small (COGWHEEL / MILLSTONE) = 8 teeth → half-pitch = 360/16 = 22.5°
+     *                large (LARGE_COGWHEEL)        = 16 teeth → half-pitch = 360/32 = 11.25°
+     *
+     * Applied to the PLACED gear only; offset is constant regardless of net.angle because
+     * the ±speedMultiplier terms in the meshing invariant cancel exactly.
+     *
+     * Axle connections (same-axis, same-direction) need no offset.
+     */
+    private fun computeMeshOffset(entry: GearEntry): Float {
+        val connections = findNeighborConnections(entry.pos, entry.axis, entry.gearType)
+        for ((_, isAxial) in connections) {
+            if (!isAxial) {
+                // Any lateral connection determines the offset from the PLACED gear's tooth count
+                return when (entry.gearType) {
+                    GearType.LARGE_COGWHEEL -> 360f / 32f   // 16 teeth → half-pitch = 11.25°
+                    else                    -> 360f / 16f   // 8 teeth  → half-pitch = 22.5°
+                }
+            }
+        }
+        return 0f   // isolated gear or axle-only connections
     }
 
     private fun computeTotalQ(orientQ: Quaternionf, angle: Float): Quaternionf =
