@@ -37,8 +37,10 @@ class AxleInteractListener(
         val player = event.player
         val block = event.clickedBlock ?: return
 
-        // ── Right-click on barrier → check if it belongs to a millstone ──────
-        if (block.type == Material.BARRIER) {
+        // ── Right-click on barrier → millstone inventory (unless sneaking) ────
+        // Sneaking bypasses the custom handler so the player can place blocks
+        // on the barrier face normally (hopper, another millstone, stone, etc.)
+        if (block.type == Material.BARRIER && !player.isSneaking) {
             val pos = dev.createonmc.axle.AxlePos(block.world.name, block.x, block.y, block.z)
             val entry = gearManager.getEntry(pos)
             if (entry?.gearType == GearType.MILLSTONE) {
