@@ -26,6 +26,13 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         private const val MAX_STEP_TICKS = 4
         private const val MAX_STEP_ANGLE = 90f
         const val WATER_WHEEL_RPM = 16f
+
+        // ── Stress values (SU per RPM), matching Create mod ──────────────────
+        const val STRESS_CAPACITY_WATER_WHEEL = 16f   // SU generated per RPM
+        const val STRESS_CAPACITY_MOTOR       = 256f  // SU generated per RPM (creative-style)
+        const val STRESS_IMPACT_MILLSTONE     = 4f    // SU consumed per RPM
+        private const val TICKS_PER_MINUTE    = 20f * 60f
+        private const val DPT_TO_RPM          = TICKS_PER_MINUTE / 360f  // multiply dpt → rpm
     }
 
     // Barrier block offsets relative to gear position, per gear type (generic collision shapes)
@@ -354,7 +361,11 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
 
     // ─── Helpers ─────────────────────────────────────────────────────────────
 
-    // Fastest motor's networkBaseDpt (signed); each gear's visual speed = baseDpt * speedMultiplier
+    /**
+     * Fastest motor's networkBaseDpt (signed).
+     * Returns 0 if no motor is present OR if the network is overstressed.
+     * Also updates network.stressCapacity / stressImpact as a side-effect.
+     */
     private fun networkEffectiveDpt(network: GearNetwork): Float {
         var best = 0f
         for (pos in network.motorPositions) {
@@ -363,7 +374,41 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
             val baseDpt = e.motorSpeed / e.speedMultiplier
             if (kotlin.math.abs(baseDpt) > kotlin.math.abs(best)) best = baseDpt
         }
-        return best
+        if (best == 0f) return 0f
+
+        computeNetworkStress(network, best)
+        return if (network.isOverstressed) 0f else best
+    }
+
+    /**
+     * Computes total stress capacity and impact for the network at the given baseDpt,
+     * storing results in network.stressCapacity and network.stressImpact.
+     *
+     * Stress formula (matching Create mod):
+     *   capacity/impact = baseValue × |rpm|
+     *   where rpm = baseDpt × speedMultiplier × (20×60/360)
+     *
+     * Values:
+     *   WATER_WHEEL  → +16 SU/RPM capacity
+     *   MOTOR        → +256 SU/RPM capacity  (creative-style, effectively unlimited)
+     *   MILLSTONE    → +4 SU/RPM impact
+     *   others       → no stress (pure transmission)
+     */
+    private fun computeNetworkStress(network: GearNetwork, baseDpt: Float) {
+        var capacity = 0f
+        var impact   = 0f
+        for ((pos, mult) in network.members) {
+            val entry = gearsByPos[pos] ?: continue
+            val rpm = kotlin.math.abs(baseDpt * mult) * DPT_TO_RPM
+            when (entry.gearType) {
+                GearType.WATER_WHEEL -> capacity += STRESS_CAPACITY_WATER_WHEEL * rpm
+                GearType.MOTOR       -> capacity += STRESS_CAPACITY_MOTOR       * rpm
+                GearType.MILLSTONE   -> impact   += STRESS_IMPACT_MILLSTONE     * rpm
+                else -> { /* cogwheels, axles: zero stress */ }
+            }
+        }
+        network.stressCapacity = capacity
+        network.stressImpact   = impact
     }
 
     // Step ticks based on the fastest visual speed across all members
