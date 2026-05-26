@@ -150,12 +150,14 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         if (!connectGear(entry)) return false
 
         val net = networks[entry.networkId]
-        if (net != null && net.motorPositions.isNotEmpty()) {
-            val correctAngle = net.angle * entry.speedMultiplier
-            (plugin.server.getEntity(entry.displayUuid) as? ItemDisplay)?.transformation =
-                Transformation(entry.translation, computeTotalQ(entry.orientQ, correctAngle),
-                    Vector3f(SCALE), Quaternionf(0f, 0f, 0f, 1f))
+        val initialQ = if (net != null && net.motorPositions.isNotEmpty()) {
+            computeTotalQ(entry.orientQ, net.angle * entry.speedMultiplier)
+        } else {
+            computeTotalQ(entry.orientQ, 0f)
         }
+        entry.currentDisplayQ = Quaternionf(initialQ)
+        (plugin.server.getEntity(entry.displayUuid) as? ItemDisplay)?.transformation =
+            Transformation(entry.translation, initialQ, Vector3f(SCALE), Quaternionf(0f, 0f, 0f, 1f))
 
         return true
     }
@@ -560,7 +562,10 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
                 translation       = display.transformation.translation,
                 isMotor           = isMotor,
                 motorSpeed        = motorSpeed,
-                extraDisplayUuids = extraUuids
+                extraDisplayUuids = extraUuids,
+                // Seed currentDisplayQ from the display's saved rotation so the
+                // first delta step continues from wherever the gear was on shutdown.
+                currentDisplayQ   = Quaternionf(display.transformation.leftRotation)
             )
 
             gearsByPos[pos] = entry
@@ -718,19 +723,23 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
             net.ticksLeft = stepTicks
             net.angle = ((net.angle + baseDpt * stepTicks) % 360f + 360f) % 360f
 
+            // Delta quaternion for this step: a small Y-axis rotation.
+            // Each gear multiplies its own currentDisplayQ by this delta scaled
+            // by its speedMultiplier, keeping consecutive quaternions always in
+            // the same hemisphere (dot = cos(Δ/2) > 0 for |Δ| < 180°).
+            val baseStepAngle = baseDpt * stepTicks   // degrees the reference gear advances
+
             for (pos in net.members.keys) {
                 val entry = gearsByPos[pos] ?: continue
                 val display = plugin.server.getEntity(entry.displayUuid) as? ItemDisplay ?: continue
                 val t = display.transformation
-                val newQ = computeTotalQ(entry.orientQ, net.angle * entry.speedMultiplier)
-                // Quaternions q and −q represent the same rotation, but the client
-                // interpolates numerically along the shortest arc. If the new quaternion
-                // is in the opposite hemisphere (dot < 0), negate it so the client
-                // always takes the short path and never produces a 180° flip.
-                val safeQ = if (t.leftRotation.dot(newQ) < 0f)
-                    Quaternionf(-newQ.x, -newQ.y, -newQ.z, -newQ.w) else newQ
+
+                val deltaQ = RotationUtil.axisAngle(0f, 1f, 0f, baseStepAngle * entry.speedMultiplier)
+                val newQ = Quaternionf(entry.currentDisplayQ).mul(deltaQ).normalize()
+                entry.currentDisplayQ = Quaternionf(newQ)
+
                 display.transformation = Transformation(
-                    entry.translation, safeQ, t.scale, t.rightRotation
+                    entry.translation, newQ, t.scale, t.rightRotation
                 )
                 display.interpolationDuration = stepTicks
                 display.interpolationDelay = 0

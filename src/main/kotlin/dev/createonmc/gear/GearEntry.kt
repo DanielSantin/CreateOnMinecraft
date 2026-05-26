@@ -18,5 +18,13 @@ class GearEntry(
     var motorSpeed: Float = 0f,
     var networkId: Int = -1,
     var speedMultiplier: Float = 1.0f,
-    val extraDisplayUuids: List<UUID> = emptyList()
+    val extraDisplayUuids: List<UUID> = emptyList(),
+    /**
+     * The quaternion we actually sent to the ItemDisplay last tick.
+     * Used for delta-based rotation: each step we multiply by a small
+     * axisAngle delta instead of recomputing from the absolute network angle.
+     * This guarantees dot(prev, next) = cos(Δ/2) > 0 for any Δ < 180°,
+     * so the client never picks the wrong interpolation arc (180° flip).
+     */
+    var currentDisplayQ: Quaternionf = Quaternionf()   // identity; overwritten on first tick
 )
