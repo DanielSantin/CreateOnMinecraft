@@ -649,7 +649,7 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
             val worldName  = pdc.get(pdcWorldName, PersistentDataType.STRING)!!
 
             val pos = AxlePos(worldName, bx, by, bz)
-            if (gearsByPos.containsKey(pos)) return@runCatching  // já restaurado
+            if (gearsByPos.containsKey(pos)) return false  // already registered — not a new restore
 
             val display = plugin.server.getEntity(displayId) as? ItemDisplay
                 ?: run { interaction.remove(); return@runCatching }
