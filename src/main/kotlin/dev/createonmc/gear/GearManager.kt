@@ -154,19 +154,74 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         tagInteraction(interaction, entry)
         if (gearType == GearType.MILLSTONE) millstoneData[pos] = MillstoneData()
 
+        // ── Pre-connect: find neighbours before networks are merged ─────────────────
+        // Must be done BEFORE connectGear() so we can distinguish spinning from stopped.
+        val preConnectConns = findNeighborConnections(pos, axis, gearType)
+
+        val allAxialNeighbors = preConnectConns
+            .filter { (_, isAxial) -> isAxial }
+            .mapNotNull { (nPos, _) -> gearsByPos[nPos] }
+        // Prefer the axial neighbour that is already motor-driven (spinning side).
+        val activeAxialNeighbor: GearEntry? =
+            allAxialNeighbors.firstOrNull { n -> networks[n.networkId]?.motorPositions?.isNotEmpty() == true }
+            ?: allAxialNeighbors.firstOrNull()
+
+        // First lateral (meshing) neighbour — needed to align the tooth phase of gears
+        // that connect only laterally (e.g. millstone, lone cogwheel on a perpendicular shaft).
+        val activeLateralNeighbor: GearEntry? = preConnectConns
+            .firstOrNull { (_, isAxial) -> !isAxial }
+            ?.let { (nPos, _) -> gearsByPos[nPos] }
+
+        // Snapshot active-side positions so resyncAxialChain won't snap them.
+        val activeNetPositions: Set<AxlePos> =
+            activeAxialNeighbor?.let { networks[it.networkId]?.members?.keys?.toSet() } ?: emptySet()
+
         if (!connectGear(entry)) return false
 
         val net = networks[entry.networkId]
-        val baseAngle = if (net != null && net.motorPositions.isNotEmpty())
-            net.angle * entry.speedMultiplier else 0f
-        // Mesh offset: shift by half a tooth pitch so teeth interlock instead of collide.
-        // This offset is constant (independent of net.angle) — proved by the meshing
-        // invariant θ_A + θ_B = const, where the ±speedMultiplier terms cancel.
         val meshOffset = computeMeshOffset(entry)
-        val initialQ = computeTotalQ(entry.orientQ, baseAngle + meshOffset)
+
+        // ── Choose initial quaternion — three cases ──────────────────────────────────
+        //
+        //  1. Axial neighbour  → copy live Q exactly (same orientQ + multiplier, zero drift)
+        //
+        //  2. Lateral neighbour → decompose neighbour's live Q to extract its current
+        //     Y-axis angle, scale by gear ratio, add half-tooth mesh offset.
+        //     Avoids the mismatch between delta-accumulated Q and net.angle reconstruction
+        //     that previously misaligned millstone / cogwheel teeth on placement.
+        //
+        //  3. No neighbours    → reconstruct from net.angle (isolated / first in chain).
+        val initialQ: Quaternionf = when {
+            activeAxialNeighbor != null -> {
+                Quaternionf(activeAxialNeighbor.currentDisplayQ)
+            }
+            activeLateralNeighbor != null -> {
+                // orientQ⁻¹ × neighbourQ  =  axisAngle(Y, θ_neighbour)  for same-axis gears.
+                val localRot = Quaternionf(entry.orientQ).conjugate()
+                    .mul(activeLateralNeighbor.currentDisplayQ)
+                val neighbourAngle = 2f *
+                    kotlin.math.atan2(localRot.y.toDouble(), localRot.w.toDouble()).toFloat() *
+                    (180f / Math.PI.toFloat())
+                // Gear ratio between the two members (e.g. −1 for same-size, −2 or −0.5 for mixed).
+                val ratio = if (activeLateralNeighbor.speedMultiplier != 0f)
+                    entry.speedMultiplier / activeLateralNeighbor.speedMultiplier else 0f
+                computeTotalQ(entry.orientQ, neighbourAngle * ratio + meshOffset)
+            }
+            else -> {
+                val baseAngle = if (net != null && net.motorPositions.isNotEmpty())
+                    net.angle * entry.speedMultiplier else 0f
+                computeTotalQ(entry.orientQ, baseAngle + meshOffset)
+            }
+        }
         entry.currentDisplayQ = Quaternionf(initialQ)
         (plugin.server.getEntity(entry.displayUuid) as? ItemDisplay)?.transformation =
             Transformation(entry.translation, initialQ, Vector3f(SCALE), Quaternionf(0f, 0f, 0f, 1f))
+
+        // ── Propagate Q through the stopped side of the axle chain ───────────────────
+        // Gears that were disconnected kept their old stopped Q.  BFS outward from the
+        // newly placed gear and snap every stopped axial member to the correct angle.
+        // activeNetPositions are already in-sync and are excluded to avoid visual hitches.
+        resyncAxialChain(entry, activeNetPositions)
 
         return true
     }
@@ -776,12 +831,19 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
             // the same hemisphere (dot = cos(Δ/2) > 0 for |Δ| < 180°).
             val baseStepAngle = baseDpt * stepTicks   // degrees the reference gear advances
 
+            // Performance: many gears in a straight chain share the same speedMultiplier.
+            // Compute axisAngle once per unique multiplier and reuse — avoids N trig
+            // calls for a long axle run (sin/cos per call is the expensive part).
+            val deltaQByMult = HashMap<Float, Quaternionf>(4)
+
             for (pos in net.members.keys) {
                 val entry = gearsByPos[pos] ?: continue
                 val display = plugin.server.getEntity(entry.displayUuid) as? ItemDisplay ?: continue
                 val t = display.transformation
 
-                val deltaQ = RotationUtil.axisAngle(0f, 1f, 0f, baseStepAngle * entry.speedMultiplier)
+                val deltaQ = deltaQByMult.getOrPut(entry.speedMultiplier) {
+                    RotationUtil.axisAngle(0f, 1f, 0f, baseStepAngle * entry.speedMultiplier)
+                }
                 val newQ = Quaternionf(entry.currentDisplayQ).mul(deltaQ).normalize()
                 entry.currentDisplayQ = Quaternionf(newQ)
 
@@ -945,6 +1007,53 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
             }
         }
         return 0f   // isolated gear or axle-only connections
+    }
+
+    /**
+     * BFS outward from [startEntry] through every axial connection in the same network,
+     * copying [currentDisplayQ] and snapping the ItemDisplay for gears that just
+     * rejoined the network after being stopped while disconnected.
+     *
+     * [skipPositions] — the set of positions that were already in the active (spinning)
+     * network before the merge.  They are skipped entirely so we never interrupt an
+     * ongoing interpolation on a gear that was already correct.
+     *
+     * Only axial connections are followed: gears connected laterally (opposite sign /
+     * different ratio) have a different orientQ and need different treatment.
+     */
+    private fun resyncAxialChain(startEntry: GearEntry, skipPositions: Set<AxlePos> = emptySet()) {
+        // Pre-seed visited with skip set so the BFS never enters the active side
+        val visited = mutableSetOf<AxlePos>(startEntry.pos)
+        visited.addAll(skipPositions)
+        val queue = ArrayDeque<GearEntry>()
+        queue.add(startEntry)
+
+        while (queue.isNotEmpty()) {
+            val cur = queue.removeFirst()
+            for ((nPos, isAxial) in findNeighborConnections(cur.pos, cur.axis, cur.gearType)) {
+                if (!isAxial || nPos in visited) continue
+                val neighbor = gearsByPos[nPos] ?: continue
+                if (neighbor.networkId != startEntry.networkId) continue
+                visited.add(nPos)
+
+                // Copy Q from the current node — all axial members share the same
+                // orientQ and speedMultiplier, so this is an exact match.
+                neighbor.currentDisplayQ = Quaternionf(cur.currentDisplayQ)
+                (plugin.server.getEntity(neighbor.displayUuid) as? ItemDisplay)?.let { display ->
+                    val t = display.transformation
+                    display.transformation = Transformation(
+                        neighbor.translation,
+                        Quaternionf(cur.currentDisplayQ),
+                        t.scale,
+                        t.rightRotation
+                    )
+                    display.interpolationDuration = 0
+                    display.interpolationDelay    = 0
+                }
+
+                queue.add(neighbor)
+            }
+        }
     }
 
     private fun computeTotalQ(orientQ: Quaternionf, angle: Float): Quaternionf =
