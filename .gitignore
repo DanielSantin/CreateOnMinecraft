@@ -5,12 +5,11 @@
 .gradle/
 build/
 gradle-app.setting
-!gradle/wrapper/gradle-wrapper.jar
-!gradle/wrapper/gradle-wrapper.properties
 
-# Compiled
+# Compiled (exceto o wrapper do Gradle)
 *.class
 *.jar
+!gradle/wrapper/gradle-wrapper.jar
 
 # IDE
 .idea/
@@ -21,5 +20,5 @@ gradle-app.setting
 .DS_Store
 Thumbs.db
 
-# Local server path (build.gradle.kts aponta para pasta local)
-# Não commitamos o servidor, só o plugin
+# Configurações locais de máquina (não commitar)
+local.properties

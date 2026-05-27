@@ -28,7 +28,15 @@ configurations.named("compileClasspath") {
     }
 }
 
-val serverDir = file("${rootProject.projectDir}/../CreateOnMinecraftServer")
+// ── Localiza o servidor automaticamente (Linux ou Windows) ───────────────────
+val serverDir: File = run {
+    listOf("../CreateOnMC", "../CreateOnMinecraftServer")
+        .map { file("${rootProject.projectDir}/$it") }
+        .firstOrNull { it.exists() }
+        ?: file("${rootProject.projectDir}/../CreateOnMinecraftServer") // fallback
+}
+
+val isWindows = System.getProperty("os.name").lowercase().contains("windows")
 
 tasks {
     shadowJar {
@@ -39,18 +47,49 @@ tasks {
     build {
         dependsOn(shadowJar)
     }
+
     register("deploy") {
+        group = "minecraft"
+        description = "Compila o plugin, copia para o servidor e o reinicia."
         dependsOn(shadowJar)
         doLast {
-            exec {
-                commandLine("cmd", "/c", "taskkill /F /FI \"WINDOWTITLE eq CreateOnMinecraftServer*\"")
-                isIgnoreExitValue = true
+            println("📦 JAR copiado para: ${serverDir.absolutePath}/plugins")
+
+            if (isWindows) {
+                // ── Windows ──────────────────────────────────────────────
+                exec {
+                    commandLine("cmd", "/c", "taskkill /F /FI \"WINDOWTITLE eq CreateOnMinecraftServer*\"")
+                    isIgnoreExitValue = true
+                }
+                Thread.sleep(2000)
+                ProcessBuilder("cmd", "/c", "start start.bat")
+                    .directory(serverDir)
+                    .start()
+
+            } else {
+                // ── Linux ────────────────────────────────────────────────
+                val pidFile = File(serverDir, "server.pid")
+
+                if (pidFile.exists()) {
+                    val pid = pidFile.readText().trim()
+                    println("🛑 Parando servidor (PID $pid)...")
+                    exec {
+                        commandLine("bash", "-c", "kill $pid 2>/dev/null || true")
+                        isIgnoreExitValue = true
+                    }
+                    pidFile.delete()
+                    Thread.sleep(3000) // aguarda o processo encerrar
+                } else {
+                    println("ℹ️  server.pid não encontrado — subindo servidor pela primeira vez.")
+                }
+
+                // Inicia em background; start.sh grava o PID em server.pid
+                ProcessBuilder("bash", "start.sh")
+                    .directory(serverDir)
+                    .start()
             }
-            Thread.sleep(2000)
-            ProcessBuilder("cmd", "/c", "start start.bat")
-                .directory(serverDir)
-                .start()
-            println("Server restarting...")
+
+            println("✅ Servidor reiniciando...")
         }
     }
 }
