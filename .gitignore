@@ -15,6 +15,7 @@ gradle-app.setting
 .idea/
 *.iml
 .vscode/
+bin/
 
 # OS
 .DS_Store
