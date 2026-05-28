@@ -13,3 +13,6 @@ commands:
   gearstress:
     description: Multiply gear placements in a line for performance testing
     usage: /gearstress <n>
+  ssgitem:
+    description: Give a preview display item for texture testing
+    usage: /ssgitem <model_id>

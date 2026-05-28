@@ -1,28 +1,41 @@
 package dev.createonmc.listeners
 
 import dev.createonmc.axle.AxleAxis
+import dev.createonmc.axle.AxlePos
 import dev.createonmc.commands.GearStressCommand
+import dev.createonmc.commands.SSGItemCommand
 import dev.createonmc.gear.GearManager
 import dev.createonmc.gear.MillstoneData
 import dev.createonmc.gear.GearType
 import dev.createonmc.util.AxleUtil
+import org.bukkit.Location
 import org.bukkit.Material
 import org.bukkit.NamespacedKey
+import org.bukkit.entity.ItemDisplay
 import org.bukkit.entity.Player
 import org.bukkit.event.EventHandler
 import org.bukkit.event.Listener
 import org.bukkit.event.block.Action
 import org.bukkit.event.player.PlayerInteractEvent
+import org.bukkit.inventory.ItemStack
+import org.bukkit.inventory.meta.ItemMeta
 import org.bukkit.persistence.PersistentDataType
+import org.bukkit.util.Transformation
+import org.joml.Quaternionf
+import org.joml.Vector3f
+import java.util.UUID
 
 class AxleInteractListener(
     private val gearManager: GearManager,
-    private val stressCommand: GearStressCommand
+    private val stressCommand: GearStressCommand,
+    private val ssgItemCommand: SSGItemCommand
 ) : Listener {
 
     private val rpmKey = NamespacedKey("createonmc", "motor_rpm")
     // Guard against Paper firing PlayerInteractEvent for both hands in the same tick
-    private val recentPlacements = mutableMapOf<java.util.UUID, Long>()
+    private val recentPlacements = mutableMapOf<UUID, Long>()
+    // Preview displays: barrier pos → ItemDisplay UUID (in-memory only, no persistence needed)
+    private val previewByPos = mutableMapOf<AxlePos, UUID>()
 
     @EventHandler
     fun onRightClickBlock(event: PlayerInteractEvent) {
@@ -36,30 +49,63 @@ class AxleInteractListener(
             val pos = dev.createonmc.axle.AxlePos(block.world.name, block.x, block.y, block.z)
             val entry = gearManager.getEntry(pos)
             if (entry != null) {
-                event.isCancelled = true
-                if (entry.gearType == GearType.MILLSTONE) {
-                    handleMillstoneInteract(player, pos)
-                    return
-                }
-                // Holding a placement item → place adjacent, inheriting this gear's axis
-                if (player.inventory.itemInMainHand.type == Material.STICK) {
-                    val gearType = heldGearType(player) ?: return
+                val heldGear = heldGearType(player)
+
+                // Holding a gear item → placement mode: inherit axis and place adjacent
+                if (heldGear != null) {
                     val now = System.currentTimeMillis()
                     if (now - (recentPlacements[player.uniqueId] ?: 0L) < 100L) return
                     recentPlacements[player.uniqueId] = now
+                    event.isCancelled = true
                     val target = block.getRelative(event.blockFace)
-                    val (orientQ, axis) = if (gearType == GearType.MILLSTONE)
+                    val (orientQ, axis) = if (heldGear == GearType.MILLSTONE)
                         AxleUtil.orientFromFace(org.bukkit.block.BlockFace.UP)
                     else
                         entry.orientQ to entry.axis
-                    val (isMotor, rpm) = motorParams(gearType, player)
-                    spawnLine(player, target.x, target.y, target.z, orientQ, axis, gearType, isMotor, rpm)
+                    val (isMotor, rpm) = motorParams(heldGear, player)
+                    spawnLine(player, target.x, target.y, target.z, orientQ, axis, heldGear, isMotor, rpm)
+                    return
                 }
-                return
+
+                // Millstone UI: only when not holding a placeable item
+                if (entry.gearType == GearType.MILLSTONE) {
+                    event.isCancelled = true
+                    handleMillstoneInteract(player, pos)
+                    return
+                }
+
+                // Any other gear: let vanilla handle it (player can place blocks on the barrier face)
             }
         }
 
         if (player.inventory.itemInMainHand.type != Material.STICK) return
+
+        // ── Preview item placement ────────────────────────────────────────────
+        val previewModelId = player.inventory.itemInMainHand.itemMeta
+            ?.persistentDataContainer?.get(ssgItemCommand.previewModelKey, PersistentDataType.STRING)
+        if (previewModelId != null) {
+            val now = System.currentTimeMillis()
+            if (now - (recentPlacements[player.uniqueId] ?: 0L) < 100L) return
+            recentPlacements[player.uniqueId] = now
+            event.isCancelled = true
+            val target = block.getRelative(event.blockFace)
+            val pos = AxlePos(player.world.name, target.x, target.y, target.z)
+            if (previewByPos.containsKey(pos) || gearManager.getEntry(pos) != null) return
+            val loc = Location(player.world, target.x + 0.5, target.y + 0.5, target.z + 0.5)
+            val display = player.world.spawn(loc, ItemDisplay::class.java) { e ->
+                e.itemDisplayTransform = ItemDisplay.ItemDisplayTransform.NONE
+                e.interpolationDuration = 0
+                e.transformation = Transformation(Vector3f(), Quaternionf(), Vector3f(1f, 1f, 1f), Quaternionf())
+            }
+            val previewStack = ItemStack(Material.STICK)
+            val previewMeta: ItemMeta = previewStack.itemMeta!!
+            previewMeta.setItemModel(NamespacedKey("ssggearmachine", previewModelId))
+            previewStack.itemMeta = previewMeta
+            display.setItemStack(previewStack)
+            target.type = Material.BARRIER
+            previewByPos[pos] = display.uniqueId
+            return
+        }
 
         val gearType = heldGearType(player) ?: return
 
@@ -144,7 +190,7 @@ class AxleInteractListener(
         gearManager.saveMillstoneState(pos)
     }
 
-    // Hit a barrier block to remove the gear covering it
+    // Hit a barrier block to remove whatever is there (preview or gear)
     @EventHandler
     fun onHitBarrier(event: PlayerInteractEvent) {
         if (event.action != Action.LEFT_CLICK_BLOCK) return
@@ -152,6 +198,15 @@ class AxleInteractListener(
         val block = event.clickedBlock ?: return
         if (block.type != Material.BARRIER) return
         event.isCancelled = true
+
+        val pos = AxlePos(block.world.name, block.x, block.y, block.z)
+        val previewUuid = previewByPos.remove(pos)
+        if (previewUuid != null) {
+            block.type = Material.AIR
+            block.world.getEntity(previewUuid)?.remove()
+            return
+        }
+
         gearManager.removeGear(block.world, block.x, block.y, block.z, dropItem = true)
     }
 

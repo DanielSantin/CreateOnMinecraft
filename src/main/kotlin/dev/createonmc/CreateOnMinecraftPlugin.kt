@@ -2,6 +2,7 @@ package dev.createonmc
 
 import dev.createonmc.commands.GearStressCommand
 import dev.createonmc.commands.SSGGiveCommand
+import dev.createonmc.commands.SSGItemCommand
 import dev.createonmc.gear.GearManager
 import dev.createonmc.listeners.AxleInteractListener
 import dev.createonmc.listeners.GearChunkListener
@@ -13,16 +14,18 @@ class CreateOnMinecraftPlugin : JavaPlugin() {
     lateinit var gearManager: GearManager
         private set
     val stressCommand = GearStressCommand()
+    val ssgItemCommand = SSGItemCommand()
 
     override fun onEnable() {
         gearManager = GearManager(this)
-        server.pluginManager.registerEvents(AxleInteractListener(gearManager, stressCommand), this)
+        server.pluginManager.registerEvents(AxleInteractListener(gearManager, stressCommand, ssgItemCommand), this)
         server.pluginManager.registerEvents(GearChunkListener(gearManager), this)
         server.pluginManager.registerEvents(WaterDebugListener(logger), this)
         val ssgGive = SSGGiveCommand()
         getCommand("ssggive")?.setExecutor(ssgGive)
         getCommand("ssggive")?.tabCompleter = ssgGive
         getCommand("gearstress")?.setExecutor(stressCommand)
+        getCommand("ssgitem")?.setExecutor(ssgItemCommand)
         logger.info("CreateOnMinecraft enabled!")
     }
 

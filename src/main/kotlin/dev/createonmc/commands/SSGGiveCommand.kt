@@ -26,9 +26,9 @@ class SSGGiveCommand : CommandExecutor, TabCompleter {
         }
 
         val stack = when (type) {
-            "gear"        -> makeItem("gear", "Gear")
-            "biggear"     -> makeItem("biggear", "Big Gear")
-            "eixo"        -> makeItem("eixo", "Eixo")
+            "gear"        -> makeItem("gear", "Cogwheel")
+            "biggear"     -> makeItem("biggear", "Large Cogwheel")
+            "eixo"        -> makeItem("eixo", "Axle")
             "water_wheel" -> makeItem("water_wheel", "Water Wheel")
             "millstone"   -> makeItem("millstone", "Millstone")
             "motor" -> {

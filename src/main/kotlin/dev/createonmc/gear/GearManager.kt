@@ -227,9 +227,8 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
             ms.inputItem?.let { mat -> if (ms.inputCount > 0) world.dropItemNaturally(dropLoc, org.bukkit.inventory.ItemStack(mat, ms.inputCount)) }
             ms.outputItems.forEach { world.dropItemNaturally(dropLoc, it) }
         }
-        if (dropItem) gearDropItem(entry.gearType)?.let {
-            world.dropItemNaturally(Location(world, bx + 0.5, by + 0.8, bz + 0.5), it)
-        }
+        if (dropItem) world.dropItemNaturally(
+            Location(world, bx + 0.5, by + 0.8, bz + 0.5), gearDropItem(entry.gearType))
 
         val network = networks[entry.networkId] ?: return
         network.members.remove(pos)
@@ -1074,14 +1073,17 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         return stack
     }
 
-    private fun gearDropItem(type: GearType): ItemStack? {
+    private fun gearDropItem(type: GearType): ItemStack {
         val (modelId, displayName) = when (type) {
-            GearType.WATER_WHEEL -> "water_wheel" to "Water Wheel"
-            GearType.MILLSTONE   -> "millstone" to "Millstone"
-            else -> return null
+            GearType.COGWHEEL       -> "gear"        to "Cogwheel"
+            GearType.LARGE_COGWHEEL -> "biggear"     to "Large Cogwheel"
+            GearType.AXLE           -> "eixo"        to "Axle"
+            GearType.MOTOR          -> "motor"       to "Motor"
+            GearType.WATER_WHEEL    -> "water_wheel" to "Water Wheel"
+            GearType.MILLSTONE      -> "millstone"   to "Millstone"
         }
         val stack = ItemStack(Material.STICK)
-        val meta: ItemMeta = stack.itemMeta ?: return null
+        val meta: ItemMeta = stack.itemMeta ?: return stack
         meta.setItemModel(NamespacedKey("ssggearmachine", modelId))
         meta.setDisplayName("§r$displayName")
         stack.itemMeta = meta
