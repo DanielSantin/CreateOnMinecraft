@@ -8,7 +8,6 @@ import org.bukkit.Location
 import org.bukkit.Material
 import org.bukkit.NamespacedKey
 import org.bukkit.World
-import org.bukkit.entity.Interaction
 import org.bukkit.entity.ItemDisplay
 import org.bukkit.inventory.ItemStack
 import org.bukkit.inventory.meta.ItemMeta
@@ -36,26 +35,23 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         private const val DPT_TO_RPM          = TICKS_PER_MINUTE / 360f  // multiply dpt → rpm
     }
 
-    // Barrier block offsets relative to gear position, per gear type (generic collision shapes)
-    private val colliderOffsets: Map<GearType, List<Triple<Int,Int,Int>>> = mapOf(
-        GearType.WATER_WHEEL to listOf(Triple(0, 0, 0)),
-        GearType.MILLSTONE   to listOf(Triple(0, 0, 0))
-    )
+    // Barrier block offsets relative to gear origin — all types get 1 barrier at (0,0,0).
+    // Future multi-block shapes override specific types with additional offsets.
+    private val colliderOffsets: Map<GearType, List<Triple<Int,Int,Int>>> =
+        GearType.values().associateWith { listOf(Triple(0, 0, 0)) }
 
     private val gearsByPos = mutableMapOf<AxlePos, GearEntry>()
-    private val interactionToPos = mutableMapOf<UUID, AxlePos>()
     val networks = mutableMapOf<Int, GearNetwork>()
     val millstoneData = mutableMapOf<AxlePos, MillstoneData>()
     private var nextNetworkId = 0
     private var tickCount = 0
 
-    // ─── PDC keys (stored on the Interaction entity for persistence) ─────────
+    // ─── PDC keys (stored on the ItemDisplay entity for persistence) ────────
     private val pdcGearType    = NamespacedKey(plugin, "gear_type")
     private val pdcAxis        = NamespacedKey(plugin, "axis")
     private val pdcOrientQ     = NamespacedKey(plugin, "orient_q")     // "x,y,z,w"
     private val pdcIsMotor     = NamespacedKey(plugin, "is_motor")
     private val pdcMotorSpeed  = NamespacedKey(plugin, "motor_speed")
-    private val pdcDisplayUuid = NamespacedKey(plugin, "display_uuid")
     private val pdcExtraUuids  = NamespacedKey(plugin, "extra_uuids")  // comma-separated
     private val pdcBX          = NamespacedKey(plugin, "bx")
     private val pdcBY          = NamespacedKey(plugin, "by")
@@ -128,16 +124,8 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         // Place barrier blocks for physical collision
         placeColliders(world, bx, by, bz, gearType)
 
-        val (iWidth, iHeight) = interactionDimensions(axis, gearType)
-        val iLoc = Location(world, bx + 0.5, by + 0.5 - iHeight / 2.0, bz + 0.5)
-        val interaction = world.spawn(iLoc, Interaction::class.java) { entity ->
-            entity.interactionWidth = iWidth
-            entity.interactionHeight = iHeight
-        }
-
         val entry = GearEntry(
             displayUuid = display.uniqueId,
-            interactionUuid = interaction.uniqueId,
             pos = pos, axis = axis,
             gearType = gearType,
             orientQ = Quaternionf(orientQ),
@@ -152,8 +140,7 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         )
         entry.cachedDisplay = display
         gearsByPos[pos] = entry
-        interactionToPos[interaction.uniqueId] = pos
-        tagInteraction(interaction, entry)
+        tagDisplay(display, entry)
         if (gearType == GearType.MILLSTONE) millstoneData[pos] = MillstoneData()
 
         // ── Pre-connect: find neighbours before networks are merged ─────────────────
@@ -231,9 +218,7 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
     fun removeGear(world: World, bx: Int, by: Int, bz: Int, dropItem: Boolean = false) {
         val pos = AxlePos(world.name, bx, by, bz)
         val entry = gearsByPos.remove(pos) ?: return
-        interactionToPos.remove(entry.interactionUuid)
-        plugin.server.getEntity(entry.displayUuid)?.remove()
-        plugin.server.getEntity(entry.interactionUuid)?.remove()
+        (entry.cachedDisplay ?: plugin.server.getEntity(entry.displayUuid))?.remove()
         entry.extraDisplayUuids.forEach { plugin.server.getEntity(it)?.remove() }
         removeColliders(world, bx, by, bz, entry.gearType)
         // Drop remaining millstone inventory items on removal
@@ -257,13 +242,13 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
     fun hasGear(world: World, bx: Int, by: Int, bz: Int): Boolean =
         gearsByPos.containsKey(AxlePos(world.name, bx, by, bz))
 
-    fun getPosForInteraction(uuid: UUID): AxlePos? = interactionToPos[uuid]
-
     fun getEntry(pos: AxlePos): GearEntry? = gearsByPos[pos]
 
-    fun getInteractionEntity(pos: AxlePos): org.bukkit.entity.Interaction? {
-        val entry = gearsByPos[pos] ?: return null
-        return plugin.server.getEntity(entry.interactionUuid) as? org.bukkit.entity.Interaction
+    fun saveMillstoneState(pos: AxlePos) {
+        val entry = gearsByPos[pos] ?: return
+        val ms = millstoneData[pos] ?: return
+        val display = entry.cachedDisplay ?: return
+        tagMillstoneState(display, ms)
     }
 
     // ─── Network logic ───────────────────────────────────────────────────────
@@ -598,8 +583,8 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
 
     // ─── Persistence ─────────────────────────────────────────────────────────
 
-    fun tagMillstoneState(interaction: Interaction, ms: MillstoneData) {
-        val pdc = interaction.persistentDataContainer
+    private fun tagMillstoneState(display: ItemDisplay, ms: MillstoneData) {
+        val pdc = display.persistentDataContainer
         pdc.set(pdcMsInputType,  PersistentDataType.STRING, ms.inputItem?.name ?: "")
         pdc.set(pdcMsInputCount, PersistentDataType.INTEGER, ms.inputCount)
         pdc.set(pdcMsProgress,   PersistentDataType.INTEGER, ms.progressTicks)
@@ -607,30 +592,28 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         pdc.set(pdcMsOutput, PersistentDataType.STRING, outputStr)
     }
 
-    private fun tagInteraction(interaction: Interaction, entry: GearEntry) {
-        val pdc = interaction.persistentDataContainer
+    private fun tagDisplay(display: ItemDisplay, entry: GearEntry) {
+        val pdc = display.persistentDataContainer
         pdc.set(pdcGearType,    PersistentDataType.STRING, entry.gearType.name)
         pdc.set(pdcAxis,        PersistentDataType.STRING, entry.axis.name)
         pdc.set(pdcOrientQ,     PersistentDataType.STRING,
             "${entry.orientQ.x},${entry.orientQ.y},${entry.orientQ.z},${entry.orientQ.w}")
         pdc.set(pdcIsMotor,     PersistentDataType.BOOLEAN, entry.isMotor)
         pdc.set(pdcMotorSpeed,  PersistentDataType.FLOAT, entry.motorSpeed)
-        pdc.set(pdcDisplayUuid, PersistentDataType.STRING, entry.displayUuid.toString())
         pdc.set(pdcExtraUuids,  PersistentDataType.STRING,
             entry.extraDisplayUuids.joinToString(","))
         pdc.set(pdcBX,          PersistentDataType.INTEGER, entry.pos.bx)
         pdc.set(pdcBY,          PersistentDataType.INTEGER, entry.pos.by)
         pdc.set(pdcBZ,          PersistentDataType.INTEGER, entry.pos.bz)
         pdc.set(pdcWorldName,   PersistentDataType.STRING, entry.pos.worldName)
-        // Write blank millstone state for new spawns so the keys exist for restore
         if (entry.gearType == GearType.MILLSTONE) {
-            tagMillstoneState(interaction, millstoneData[entry.pos] ?: MillstoneData())
+            tagMillstoneState(display, millstoneData[entry.pos] ?: MillstoneData())
         }
     }
 
-    /** Tenta restaurar uma única entidade Interaction a partir do seu PDC. */
-    fun restoreInteraction(interaction: Interaction): Boolean {
-        val pdc = interaction.persistentDataContainer
+    /** Restores a single gear from the PDC stored on its ItemDisplay entity. */
+    private fun restoreDisplay(display: ItemDisplay): Boolean {
+        val pdc = display.persistentDataContainer
         val gearTypeName = pdc.get(pdcGearType, PersistentDataType.STRING) ?: return false
 
         runCatching {
@@ -641,7 +624,6 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
                                          parts[2].toFloat(), parts[3].toFloat())
             val isMotor    = pdc.get(pdcIsMotor, PersistentDataType.BOOLEAN) ?: false
             val motorSpeed = pdc.get(pdcMotorSpeed, PersistentDataType.FLOAT) ?: 0f
-            val displayId  = UUID.fromString(pdc.get(pdcDisplayUuid, PersistentDataType.STRING)!!)
             val extraStr   = pdc.get(pdcExtraUuids, PersistentDataType.STRING) ?: ""
             val extraUuids = if (extraStr.isEmpty()) mutableListOf()
                              else extraStr.split(",").map { UUID.fromString(it.trim()) }.toMutableList()
@@ -653,12 +635,8 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
             val pos = AxlePos(worldName, bx, by, bz)
             if (gearsByPos.containsKey(pos)) return false  // already registered — not a new restore
 
-            val display = plugin.server.getEntity(displayId) as? ItemDisplay
-                ?: run { interaction.remove(); return@runCatching }
-
             val entry = GearEntry(
-                displayUuid       = displayId,
-                interactionUuid   = interaction.uniqueId,
+                displayUuid       = display.uniqueId,
                 pos               = pos,
                 axis              = axis,
                 gearType          = gearType,
@@ -667,14 +645,11 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
                 isMotor           = isMotor,
                 motorSpeed        = motorSpeed,
                 extraDisplayUuids = extraUuids,
-                // Seed currentDisplayQ from the display's saved rotation so the
-                // first delta step continues from wherever the gear was on shutdown.
                 currentDisplayQ   = Quaternionf(display.transformation.leftRotation)
             )
 
             entry.cachedDisplay = display
             gearsByPos[pos] = entry
-            interactionToPos[interaction.uniqueId] = pos
             connectGear(entry)
 
             if (gearType == GearType.MILLSTONE) {
@@ -699,26 +674,30 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
                 millstoneData[pos] = ms
             }
         }.onFailure { e ->
-            plugin.logger.warning("Failed to restore gear at ${interaction.location}: ${e.message}")
+            plugin.logger.warning("Failed to restore gear at ${display.location}: ${e.message}")
             return false
         }
         return true
     }
 
-    /** Varre chunks já carregados (chamado no startup, 1 tick de delay). */
+    /** Scans loaded chunks on startup (called 1 tick after plugin enable). */
     fun restoreFromWorld() {
         var count = 0
         for (world in plugin.server.worlds)
             for (entity in world.entities)
-                if (entity is Interaction && restoreInteraction(entity)) count++
+                if (entity is ItemDisplay &&
+                    entity.persistentDataContainer.has(pdcGearType, PersistentDataType.STRING) &&
+                    restoreDisplay(entity)) count++
         if (count > 0) plugin.logger.info("Restored $count gear(s) from loaded chunks.")
     }
 
-    /** Varre um chunk recém-carregado (chamado pelo ChunkLoadEvent). */
+    /** Scans a newly loaded chunk (called by ChunkLoadEvent). */
     fun restoreFromChunk(chunk: org.bukkit.Chunk) {
         var count = 0
         for (entity in chunk.entities)
-            if (entity is Interaction && restoreInteraction(entity)) count++
+            if (entity is ItemDisplay &&
+                entity.persistentDataContainer.has(pdcGearType, PersistentDataType.STRING) &&
+                restoreDisplay(entity)) count++
         if (count > 0) plugin.logger.info("Restored $count gear(s) from chunk (${chunk.x}, ${chunk.z}).")
     }
 
@@ -806,7 +785,6 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         }
         dead.forEach { pos ->
             val e = gearsByPos.remove(pos) ?: return@forEach
-            interactionToPos.remove(e.interactionUuid)
             e.extraDisplayUuids.forEach { plugin.server.getEntity(it)?.remove() }
             millstoneData.remove(pos)
             plugin.server.getWorld(pos.worldName)?.let { w ->
@@ -910,8 +888,7 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
                 val output = ms.outputItems.find { it.type == recipe.output && it.amount < it.maxStackSize }
                 if (output != null) output.amount += recipe.outputCount
                 else ms.outputItems.add(org.bukkit.inventory.ItemStack(recipe.output, recipe.outputCount))
-                val interaction = plugin.server.getEntity(entry.interactionUuid) as? org.bukkit.entity.Interaction
-                if (interaction != null) tagMillstoneState(interaction, ms)
+                entry.cachedDisplay?.let { tagMillstoneState(it, ms) }
             }
         }
     }
@@ -985,10 +962,7 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
             }
         }
 
-        if (stateChanged) {
-            val interaction = plugin.server.getEntity(entry.interactionUuid) as? org.bukkit.entity.Interaction
-            if (interaction != null) tagMillstoneState(interaction, ms)
-        }
+        if (stateChanged) entry.cachedDisplay?.let { tagMillstoneState(it, ms) }
     }
 
     /**
@@ -1127,20 +1101,4 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         }
     }
 
-    private fun interactionDimensions(axis: AxleAxis, gearType: GearType): Pair<Float, Float> {
-        // Water wheel: barrier block handles all collision; Interaction entity is kept only
-        // for UUID mapping — give it a negligible hitbox so it never intercepts block clicks.
-        // Water wheel and millstone use barrier blocks for collision;
-        // the Interaction entity is kept only for UUID mapping — negligible hitbox.
-        if (gearType == GearType.WATER_WHEEL || gearType == GearType.MILLSTONE) return Pair(0.01f, 0.01f)
-        val radialSize = when (gearType) {
-            GearType.LARGE_COGWHEEL -> 1.8f
-            GearType.AXLE           -> 0.5f
-            else                    -> 1.0f
-        }
-        return when (axis) {
-            AxleAxis.Y -> Pair(radialSize, 1.0f)
-            AxleAxis.X, AxleAxis.Z -> Pair(1.1f, radialSize)
-        }
-    }
 }

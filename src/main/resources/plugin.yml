@@ -10,3 +10,6 @@ commands:
     description: Give a Create item
     usage: /ssggive <gear|biggear|eixo|motor [rpm]|water_wheel>
     permission: createonmc.ssggive
+  gearstress:
+    description: Multiply gear placements in a line for performance testing
+    usage: /gearstress <n>

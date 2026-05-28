@@ -1,30 +1,24 @@
 package dev.createonmc.listeners
 
 import dev.createonmc.axle.AxleAxis
+import dev.createonmc.commands.GearStressCommand
 import dev.createonmc.gear.GearManager
 import dev.createonmc.gear.MillstoneData
 import dev.createonmc.gear.GearType
 import dev.createonmc.util.AxleUtil
 import org.bukkit.Material
 import org.bukkit.NamespacedKey
-import org.bukkit.block.BlockFace
-import org.bukkit.entity.Interaction
 import org.bukkit.entity.Player
 import org.bukkit.event.EventHandler
 import org.bukkit.event.Listener
 import org.bukkit.event.block.Action
-import org.bukkit.event.entity.EntityDamageByEntityEvent
-import org.bukkit.event.player.PlayerInteractEntityEvent
 import org.bukkit.event.player.PlayerInteractEvent
 import org.bukkit.persistence.PersistentDataType
-import org.bukkit.util.Vector
 
 class AxleInteractListener(
-    private val gearManager: GearManager
+    private val gearManager: GearManager,
+    private val stressCommand: GearStressCommand
 ) : Listener {
-
-    constructor(plugin: dev.createonmc.CreateOnMinecraftPlugin, gearManager: GearManager)
-        : this(gearManager)
 
     private val rpmKey = NamespacedKey("createonmc", "motor_rpm")
     // Guard against Paper firing PlayerInteractEvent for both hands in the same tick
@@ -37,16 +31,30 @@ class AxleInteractListener(
         val player = event.player
         val block = event.clickedBlock ?: return
 
-        // ── Right-click on barrier → millstone inventory (unless sneaking) ────
-        // Sneaking bypasses the custom handler so the player can place blocks
-        // on the barrier face normally (hopper, another millstone, stone, etc.)
+        // ── Right-click on a barrier covering a gear ─────────────────────────
         if (block.type == Material.BARRIER && !player.isSneaking) {
             val pos = dev.createonmc.axle.AxlePos(block.world.name, block.x, block.y, block.z)
             val entry = gearManager.getEntry(pos)
-            if (entry?.gearType == GearType.MILLSTONE) {
+            if (entry != null) {
                 event.isCancelled = true
-                val interaction = gearManager.getInteractionEntity(pos)
-                if (interaction != null) handleMillstoneInteract(player, pos, interaction)
+                if (entry.gearType == GearType.MILLSTONE) {
+                    handleMillstoneInteract(player, pos)
+                    return
+                }
+                // Holding a placement item → place adjacent, inheriting this gear's axis
+                if (player.inventory.itemInMainHand.type == Material.STICK) {
+                    val gearType = heldGearType(player) ?: return
+                    val now = System.currentTimeMillis()
+                    if (now - (recentPlacements[player.uniqueId] ?: 0L) < 100L) return
+                    recentPlacements[player.uniqueId] = now
+                    val target = block.getRelative(event.blockFace)
+                    val (orientQ, axis) = if (gearType == GearType.MILLSTONE)
+                        AxleUtil.orientFromFace(org.bukkit.block.BlockFace.UP)
+                    else
+                        entry.orientQ to entry.axis
+                    val (isMotor, rpm) = motorParams(gearType, player)
+                    spawnLine(player, target.x, target.y, target.z, orientQ, axis, gearType, isMotor, rpm)
+                }
                 return
             }
         }
@@ -72,47 +80,29 @@ class AxleInteractListener(
             AxleUtil.orientFromFace(event.blockFace)
         val (isMotor, rpm) = motorParams(gearType, player)
 
-        gearManager.spawnGear(player.world, target.x, target.y, target.z, orientQ, axis,
-            gearType = gearType, isMotor = isMotor, rpm = rpm)
+        spawnLine(player, target.x, target.y, target.z, orientQ, axis, gearType, isMotor, rpm)
     }
 
-    @EventHandler
-    fun onRightClickGear(event: PlayerInteractEntityEvent) {
-        val player = event.player
-        val interaction = event.rightClicked as? Interaction ?: return
-        val pos = gearManager.getPosForInteraction(interaction.uniqueId) ?: return
-        val entry = gearManager.getEntry(pos) ?: return
-        event.isCancelled = true
-
-        // ── Millstone inventory interaction ──────────────────────────────────
-        if (entry.gearType == GearType.MILLSTONE) {
-            handleMillstoneInteract(player, pos, interaction)
-            return
+    private fun spawnLine(
+        player: Player, x: Int, y: Int, z: Int,
+        orientQ: org.joml.Quaternionf, axis: AxleAxis,
+        gearType: GearType, isMotor: Boolean, rpm: Float
+    ) {
+        val count = stressCommand.multipliers[player.uniqueId] ?: 1
+        val (dx, dy, dz) = when (axis) {
+            AxleAxis.X -> Triple(1, 0, 0)
+            AxleAxis.Y -> Triple(0, 1, 0)
+            AxleAxis.Z -> Triple(0, 0, 1)
         }
-
-        // ── Gear placement on adjacent face ──────────────────────────────────
-        if (player.inventory.itemInMainHand.type != Material.STICK) return
-
-        val face = rayHitFace(player.eyeLocation.toVector(), player.location.direction,
-                              pos.bx, pos.by, pos.bz) ?: return
-        val (dx, dy, dz) = faceOffset(face)
-
-        val gearType = heldGearType(player) ?: GearType.COGWHEEL
-        val (isMotor, rpm) = motorParams(gearType, player)
-
-        // MILLSTONE is always placed flat (Y-axis), regardless of the clicked gear's axis
-        val (orientQ, axis) = if (gearType == GearType.MILLSTONE)
-            AxleUtil.orientFromFace(org.bukkit.block.BlockFace.UP)
-        else
-            entry.orientQ to entry.axis
-
-        gearManager.spawnGear(
-            player.world, pos.bx + dx, pos.by + dy, pos.bz + dz,
-            orientQ, axis, gearType = gearType, isMotor = isMotor, rpm = rpm
-        )
+        var placed = 0
+        for (i in 0 until count) {
+            if (gearManager.spawnGear(player.world, x + dx * i, y + dy * i, z + dz * i,
+                    orientQ, axis, gearType = gearType, isMotor = isMotor, rpm = rpm)) placed++
+        }
+        if (count > 1) player.sendMessage("§7[GearStress] Colocadas §f$placed/$count §7gears.")
     }
 
-    private fun handleMillstoneInteract(player: org.bukkit.entity.Player, pos: dev.createonmc.axle.AxlePos, interaction: Interaction) {
+    private fun handleMillstoneInteract(player: Player, pos: dev.createonmc.axle.AxlePos) {
         val ms = gearManager.millstoneData[pos] ?: return
         val held = player.inventory.itemInMainHand.clone()
 
@@ -125,7 +115,7 @@ class AxleInteractListener(
                 val recipe = ms.currentRecipe
                 val msg = if (recipe != null)
                     "§7[Millstone] Input: §f${ms.inputCount}x ${ms.inputItem?.name} §7→ §f${recipe.output.name}"
-                else "§c[Millstone] No recipe for ${held.type.name}."  // shouldn't reach here
+                else "§c[Millstone] No recipe for ${held.type.name}."
                 player.sendMessage(msg)
             } else {
                 val reason = when {
@@ -150,21 +140,11 @@ class AxleInteractListener(
                 player.sendMessage("§7[Millstone] Empty. $inputInfo$progressInfo")
             }
         }
-        // Persist updated state
-        gearManager.tagMillstoneState(interaction, ms)
+        // Persist updated state to the ItemDisplay entity
+        gearManager.saveMillstoneState(pos)
     }
 
-    @EventHandler
-    fun onAttackGear(event: EntityDamageByEntityEvent) {
-        val player = event.damager as? Player ?: return
-        if (player.inventory.itemInMainHand.type != Material.STICK) return
-        val interaction = event.entity as? Interaction ?: return
-        val pos = gearManager.getPosForInteraction(interaction.uniqueId) ?: return
-        event.isCancelled = true
-        gearManager.removeGear(player.world, pos.bx, pos.by, pos.bz, dropItem = true)
-    }
-
-    // Hit a barrier block to remove the water wheel (or any future gear with collision blocks)
+    // Hit a barrier block to remove the gear covering it
     @EventHandler
     fun onHitBarrier(event: PlayerInteractEvent) {
         if (event.action != Action.LEFT_CLICK_BLOCK) return
@@ -173,33 +153,6 @@ class AxleInteractListener(
         if (block.type != Material.BARRIER) return
         event.isCancelled = true
         gearManager.removeGear(block.world, block.x, block.y, block.z, dropItem = true)
-    }
-
-    // Ray-AABB intersection against the unit cube [bx,bx+1]×[by,by+1]×[bz,bz+1]
-    private fun rayHitFace(eye: Vector, dir: Vector, bx: Int, by: Int, bz: Int): BlockFace? {
-        fun slabs(o: Double, d: Double, lo: Double, hi: Double): Pair<Double, Double> {
-            if (d == 0.0) return if (o in lo..hi)
-                Pair(Double.NEGATIVE_INFINITY, Double.POSITIVE_INFINITY)
-            else
-                Pair(Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY)
-            val t1 = (lo - o) / d; val t2 = (hi - o) / d
-            return if (t1 < t2) Pair(t1, t2) else Pair(t2, t1)
-        }
-
-        val (txIn, txOut) = slabs(eye.x, dir.x, bx.toDouble(), bx + 1.0)
-        val (tyIn, tyOut) = slabs(eye.y, dir.y, by.toDouble(), by + 1.0)
-        val (tzIn, tzOut) = slabs(eye.z, dir.z, bz.toDouble(), bz + 1.0)
-
-        val tIn  = maxOf(txIn, tyIn, tzIn)
-        val tOut = minOf(txOut, tyOut, tzOut)
-        if (tIn > tOut || tOut < 0) return null
-
-        return when (tIn) {
-            txIn -> if (dir.x > 0) BlockFace.WEST  else BlockFace.EAST
-            tyIn -> if (dir.y > 0) BlockFace.DOWN   else BlockFace.UP
-            tzIn -> if (dir.z > 0) BlockFace.NORTH  else BlockFace.SOUTH
-            else -> null
-        }
     }
 
     private fun heldGearType(player: Player): GearType? {
@@ -226,14 +179,4 @@ class AxleInteractListener(
             ?.persistentDataContainer
             ?.get(rpmKey, PersistentDataType.FLOAT)
             ?: 10f
-
-    private fun faceOffset(face: BlockFace): Triple<Int, Int, Int> = when (face) {
-        BlockFace.UP    -> Triple( 0,  1,  0)
-        BlockFace.DOWN  -> Triple( 0, -1,  0)
-        BlockFace.NORTH -> Triple( 0,  0, -1)
-        BlockFace.SOUTH -> Triple( 0,  0,  1)
-        BlockFace.EAST  -> Triple( 1,  0,  0)
-        BlockFace.WEST  -> Triple(-1,  0,  0)
-        else            -> Triple( 0,  0,  0)
-    }
 }

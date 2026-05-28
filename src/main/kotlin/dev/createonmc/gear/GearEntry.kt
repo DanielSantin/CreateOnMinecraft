@@ -9,7 +9,6 @@ import java.util.UUID
 
 class GearEntry(
     val displayUuid: UUID,
-    val interactionUuid: UUID,
     val pos: AxlePos,
     val axis: AxleAxis,
     val gearType: GearType,
