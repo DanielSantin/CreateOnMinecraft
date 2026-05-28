@@ -23,6 +23,7 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
     companion object {
         val PIVOT = Vector3f(0.5f, 0.5f, 0.5f)
         val SCALE = Vector3f(1f, 1f, 1f)
+        val IDENTITY_Q = Quaternionf(0f, 0f, 0f, 1f)
         private const val MAX_STEP_TICKS = 4
         private const val MAX_STEP_ANGLE = 90f
         const val WATER_WHEEL_RPM = 16f
@@ -149,6 +150,7 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
             },
             extraDisplayUuids = extraUuids
         )
+        entry.cachedDisplay = display
         gearsByPos[pos] = entry
         interactionToPos[interaction.uniqueId] = pos
         tagInteraction(interaction, entry)
@@ -670,6 +672,7 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
                 currentDisplayQ   = Quaternionf(display.transformation.leftRotation)
             )
 
+            entry.cachedDisplay = display
             gearsByPos[pos] = entry
             interactionToPos[interaction.uniqueId] = pos
             connectGear(entry)
@@ -798,8 +801,8 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
 
         val dead = mutableListOf<AxlePos>()
         for ((_, entry) in gearsByPos) {
-            val e = plugin.server.getEntity(entry.displayUuid)
-            if (e == null || !e.isValid) dead.add(entry.pos)
+            val display = entry.cachedDisplay
+            if (display == null || !display.isValid) dead.add(entry.pos)
         }
         dead.forEach { pos ->
             val e = gearsByPos.remove(pos) ?: return@forEach
@@ -838,8 +841,11 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
 
             for (pos in net.members.keys) {
                 val entry = gearsByPos[pos] ?: continue
-                val display = plugin.server.getEntity(entry.displayUuid) as? ItemDisplay ?: continue
-                val t = display.transformation
+                // Fix 1: use cached reference; fall back to getEntity() only on cache miss
+                val display = entry.cachedDisplay?.takeIf { it.isValid }
+                    ?: (plugin.server.getEntity(entry.displayUuid) as? ItemDisplay)
+                        ?.also { entry.cachedDisplay = it }
+                    ?: continue
 
                 val deltaQ = deltaQByMult.getOrPut(entry.speedMultiplier) {
                     RotationUtil.axisAngle(0f, 1f, 0f, baseStepAngle * entry.speedMultiplier)
@@ -847,10 +853,13 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
                 val newQ = Quaternionf(entry.currentDisplayQ).mul(deltaQ).normalize()
                 entry.currentDisplayQ = Quaternionf(newQ)
 
-                display.transformation = Transformation(
-                    entry.translation, newQ, t.scale, t.rightRotation
-                )
-                display.interpolationDuration = stepTicks
+                // Fix 2: scale and rightRotation are always SCALE/IDENTITY_Q — no getTransformation() needed
+                display.transformation = Transformation(entry.translation, newQ, SCALE, IDENTITY_Q)
+                // Fix 3: only call setInterpolationDuration when the value actually changes
+                if (entry.lastInterpolationDuration != stepTicks) {
+                    display.interpolationDuration = stepTicks
+                    entry.lastInterpolationDuration = stepTicks
+                }
                 display.interpolationDelay = 0
             }
         }

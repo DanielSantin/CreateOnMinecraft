@@ -2,6 +2,7 @@ package dev.createonmc.gear
 
 import dev.createonmc.axle.AxleAxis
 import dev.createonmc.axle.AxlePos
+import org.bukkit.entity.ItemDisplay
 import org.joml.Quaternionf
 import org.joml.Vector3f
 import java.util.UUID
@@ -27,4 +28,12 @@ class GearEntry(
      * so the client never picks the wrong interpolation arc (180° flip).
      */
     var currentDisplayQ: Quaternionf = Quaternionf()   // identity; overwritten on first tick
-)
+) {
+    // Cached entity reference — avoids getEntity() lookup every tick.
+    // Refreshed on spawn/restore and lazily on cache miss in tick().
+    var cachedDisplay: ItemDisplay? = null
+
+    // Last interpolationDuration sent to the display entity.
+    // setInterpolationDuration() is only called when this value changes.
+    var lastInterpolationDuration: Int = -1
+}
