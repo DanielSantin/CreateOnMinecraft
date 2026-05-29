@@ -32,10 +32,13 @@ class AxleInteractListener(
 ) : Listener {
 
     private val rpmKey = NamespacedKey("createonmc", "motor_rpm")
+    private val esteiraModel = NamespacedKey("ssggearmachine", "esteira")
     // Guard against Paper firing PlayerInteractEvent for both hands in the same tick
     private val recentPlacements = mutableMapOf<UUID, Long>()
     // Preview displays: barrier pos → ItemDisplay UUID (in-memory only, no persistence needed)
     private val previewByPos = mutableMapOf<AxlePos, UUID>()
+    // Belt tool: first axle selection per player
+    private val beltSelections = mutableMapOf<UUID, AxlePos>()
 
     @EventHandler
     fun onRightClickBlock(event: PlayerInteractEvent) {
@@ -48,6 +51,16 @@ class AxleInteractListener(
         if (block.type == Material.BARRIER && !player.isSneaking) {
             val pos = dev.createonmc.axle.AxlePos(block.world.name, block.x, block.y, block.z)
             val entry = gearManager.getEntry(pos)
+            // Belt gap: right-click with axle on a barrier that has esteira_fixed but no gear
+            if (entry == null && gearManager.hasBeltAt(pos) && heldGearType(player) == GearType.AXLE) {
+                val now = System.currentTimeMillis()
+                if (now - (recentPlacements[player.uniqueId] ?: 0L) < 100L) return
+                recentPlacements[player.uniqueId] = now
+                event.isCancelled = true
+                gearManager.addAxleToBelt(block.world, pos)
+                return
+            }
+
             if (entry != null) {
                 val heldGear = heldGearType(player)
 
@@ -64,6 +77,13 @@ class AxleInteractListener(
                         entry.orientQ to entry.axis
                     val (isMotor, rpm) = motorParams(heldGear, player)
                     spawnLine(player, target.x, target.y, target.z, orientQ, axis, heldGear, isMotor, rpm)
+                    return
+                }
+
+                // Belt tool: select axle A or B
+                if (player.inventory.itemInMainHand.itemMeta?.itemModel == esteiraModel) {
+                    event.isCancelled = true
+                    handleBeltSelection(player, pos, entry)
                     return
                 }
 
@@ -148,6 +168,34 @@ class AxleInteractListener(
         if (count > 1) player.sendMessage("§7[GearStress] Colocadas §f$placed/$count §7gears.")
     }
 
+    private fun handleBeltSelection(player: Player, pos: AxlePos, entry: dev.createonmc.gear.GearEntry) {
+        if (entry.gearType != dev.createonmc.gear.GearType.AXLE) {
+            player.sendMessage("§c[Esteira] Selecione um eixo.")
+            beltSelections.remove(player.uniqueId)
+            return
+        }
+
+        val selA = beltSelections[player.uniqueId]
+        if (selA == null) {
+            beltSelections[player.uniqueId] = pos
+            player.sendMessage("§7[Esteira] Eixo A: §f(${pos.bx}, ${pos.by}, ${pos.bz})§7. Clique no Eixo B.")
+            return
+        }
+
+        if (selA == pos) {
+            beltSelections.remove(player.uniqueId)
+            player.sendMessage("§7[Esteira] Seleção cancelada.")
+            return
+        }
+
+        beltSelections.remove(player.uniqueId)
+        if (gearManager.attachBelt(selA, pos)) {
+            player.sendMessage("§a[Esteira] Conectada!")
+        } else {
+            player.sendMessage("§c[Esteira] Falhou. Os eixos devem ser paralelos, mesmo eixo rotacional, mesma altura, e a direção da cinta deve ser perpendicular ao eixo.")
+        }
+    }
+
     private fun handleMillstoneInteract(player: Player, pos: dev.createonmc.axle.AxlePos) {
         val ms = gearManager.millstoneData[pos] ?: return
         val held = player.inventory.itemInMainHand.clone()
@@ -204,6 +252,12 @@ class AxleInteractListener(
         if (previewUuid != null) {
             block.type = Material.AIR
             block.world.getEntity(previewUuid)?.remove()
+            return
+        }
+
+        // Belt-only barrier (air-gap position with no gear entry) — break the whole belt
+        if (gearManager.getEntry(pos) == null && gearManager.hasBeltAt(pos)) {
+            gearManager.detachBelt(pos)
             return
         }
 

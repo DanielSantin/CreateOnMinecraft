@@ -43,6 +43,7 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
     private val gearsByPos = mutableMapOf<AxlePos, GearEntry>()
     val networks = mutableMapOf<Int, GearNetwork>()
     val millstoneData = mutableMapOf<AxlePos, MillstoneData>()
+    private val beltsByAxle = mutableMapOf<AxlePos, BeltEntry>()
     private var nextNetworkId = 0
     private var tickCount = 0
 
@@ -217,6 +218,7 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
 
     fun removeGear(world: World, bx: Int, by: Int, bz: Int, dropItem: Boolean = false) {
         val pos = AxlePos(world.name, bx, by, bz)
+        detachBelt(pos)
         val entry = gearsByPos.remove(pos) ?: return
         (entry.cachedDisplay ?: plugin.server.getEntity(entry.displayUuid))?.remove()
         entry.extraDisplayUuids.forEach { plugin.server.getEntity(it)?.remove() }
@@ -248,6 +250,174 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         val ms = millstoneData[pos] ?: return
         val display = entry.cachedDisplay ?: return
         tagMillstoneState(display, ms)
+    }
+
+    // ─── Belt ────────────────────────────────────────────────────────────────
+
+    fun hasBeltAt(pos: AxlePos): Boolean = beltsByAxle.containsKey(pos)
+
+    fun attachBelt(posA: AxlePos, posB: AxlePos): Boolean {
+        val entryA = gearsByPos[posA] ?: return false
+        val entryB = gearsByPos[posB] ?: return false
+        if (entryA.gearType != GearType.AXLE || entryB.gearType != GearType.AXLE) return false
+        if (entryA.axis != entryB.axis) return false
+        if (posA.worldName != posB.worldName) return false
+        if (beltsByAxle.containsKey(posA) || beltsByAxle.containsKey(posB)) return false
+
+        val (ax, ay, az) = entryA.axis.positiveOffset()
+        val deltaX = posB.bx - posA.bx
+        val deltaY = posB.by - posA.by
+        val deltaZ = posB.bz - posA.bz
+
+        if (deltaY != 0) return false
+        if (deltaX * ax + deltaZ * az != 0) return false
+        if (deltaX != 0 && deltaZ != 0) return false
+
+        val dist = kotlin.math.abs(deltaX) + kotlin.math.abs(deltaZ)
+        if (dist == 0) return false
+
+        val world = plugin.server.getWorld(posA.worldName) ?: return false
+
+        val stepX = if (deltaX != 0) deltaX / kotlin.math.abs(deltaX) else 0
+        val stepZ = if (deltaZ != 0) deltaZ / kotlin.math.abs(deltaZ) else 0
+
+        // Scan all positions A→B, validate each one
+        val allPositions = mutableListOf<AxlePos>()
+        val axlePositions = mutableSetOf<AxlePos>()
+
+        for (i in 0..dist) {
+            val px = posA.bx + stepX * i
+            val pz = posA.bz + stepZ * i
+            val pos = AxlePos(posA.worldName, px, posA.by, pz)
+            allPositions.add(pos)
+
+            val existing = gearsByPos[pos]
+            when {
+                existing != null -> {
+                    // Must be a same-axis axle not already in a belt
+                    if (existing.gearType != GearType.AXLE || existing.axis != entryA.axis) return false
+                    if (beltsByAxle.containsKey(pos)) return false
+                    axlePositions.add(pos)
+                }
+                else -> {
+                    // Must be air — no solid block may block the belt path
+                    if (!world.getBlockAt(px, posA.by, pz).type.isAir) return false
+                }
+            }
+        }
+
+        val beltAngle = when {
+            stepX > 0 ->  90f
+            stepX < 0 -> -90f
+            stepZ < 0 -> 180f
+            else      ->   0f
+        }
+        val beltOrientQ = RotationUtil.axisAngle(0f, 1f, 0f, beltAngle)
+        val spinItem = beltSpinItem()
+        val fixedItem = beltFixedItem()
+        val fixedUuids = mutableListOf<UUID>()
+
+        for (pos in allPositions) {
+            if (pos in axlePositions) {
+                // Convert axle display to esteira_spin
+                val e = gearsByPos[pos] ?: continue
+                val display = e.cachedDisplay ?: plugin.server.getEntity(e.displayUuid) as? ItemDisplay ?: continue
+                display.setItemStack(spinItem)
+            } else {
+                // Place barrier for gap position
+                world.getBlockAt(pos.bx, pos.by, pos.bz).type = Material.BARRIER
+            }
+            // Spawn esteira_fixed at every position (axle or gap)
+            val loc = Location(world, pos.bx + 0.5, pos.by + 0.5, pos.bz + 0.5)
+            val fixed = world.spawn(loc, ItemDisplay::class.java) { e ->
+                e.itemDisplayTransform = ItemDisplay.ItemDisplayTransform.NONE
+                e.interpolationDuration = 0
+                e.transformation = Transformation(Vector3f(), Quaternionf(beltOrientQ), Vector3f(SCALE), IDENTITY_Q)
+            }
+            fixed.setItemStack(fixedItem)
+            fixedUuids.add(fixed.uniqueId)
+        }
+
+        // Merge all axle networks (belt connects them at 1:1 ratio)
+        var primaryNet: GearNetwork? = null
+        for (pos in axlePositions) {
+            val e = gearsByPos[pos] ?: continue
+            val net = networks[e.networkId] ?: continue
+            if (primaryNet == null) {
+                primaryNet = net
+            } else if (net !== primaryNet) {
+                val refMult = gearsByPos[posA]?.speedMultiplier ?: 1f
+                val correction = if (e.speedMultiplier != 0f) refMult / e.speedMultiplier else 1f
+                mergeInto(primaryNet!!, net, correction)
+            }
+        }
+
+        val mergedNetworkId = primaryNet?.id ?: -1
+        val belt = BeltEntry(allPositions, axlePositions, fixedUuids, mergedNetworkId)
+        for (pos in allPositions) beltsByAxle[pos] = belt
+
+        return true
+    }
+
+    fun detachBelt(pos: AxlePos) {
+        val belt = beltsByAxle[pos] ?: return
+        val worldName = belt.allPositions.firstOrNull()?.worldName ?: return
+        val world = plugin.server.getWorld(worldName) ?: return
+
+        // Remove esteira_fixed displays
+        belt.fixedDisplayUuids.forEach { plugin.server.getEntity(it)?.remove() }
+
+        // Remove belt barriers at gap positions and revert axle displays
+        val axleItem = gearItem(GearType.AXLE)
+        for (p in belt.allPositions) {
+            beltsByAxle.remove(p)
+            if (p in belt.axlePositions) {
+                val e = gearsByPos[p] ?: continue
+                val display = e.cachedDisplay ?: plugin.server.getEntity(e.displayUuid) as? ItemDisplay ?: continue
+                display.setItemStack(axleItem)
+            } else {
+                val block = world.getBlockAt(p.bx, p.by, p.bz)
+                if (block.type == Material.BARRIER) block.type = Material.AIR
+            }
+        }
+
+        if (belt.mergedNetworkId != -1) rebuildNetworks(belt.mergedNetworkId)
+    }
+
+    fun addAxleToBelt(world: World, pos: AxlePos): Boolean {
+        val belt = beltsByAxle[pos] ?: return false
+        if (pos in belt.axlePositions) return false
+
+        val refAxlePos = belt.axlePositions.firstOrNull() ?: return false
+        val refEntry = gearsByPos[refAxlePos] ?: return false
+
+        val loc = Location(world, pos.bx + 0.5, pos.by + 0.5, pos.bz + 0.5)
+        val display = world.spawn(loc, ItemDisplay::class.java) { e ->
+            e.itemDisplayTransform = ItemDisplay.ItemDisplayTransform.NONE
+            e.interpolationDuration = 0
+            e.interpolationDelay = 0
+            e.transformation = Transformation(
+                Vector3f(), Quaternionf(refEntry.currentDisplayQ), Vector3f(SCALE), IDENTITY_Q)
+        }
+        display.setItemStack(beltSpinItem())
+
+        val entry = GearEntry(
+            displayUuid = display.uniqueId,
+            pos = pos,
+            axis = refEntry.axis,
+            gearType = GearType.AXLE,
+            orientQ = Quaternionf(refEntry.orientQ),
+            translation = Vector3f(),
+            currentDisplayQ = Quaternionf(refEntry.currentDisplayQ)
+        )
+        entry.cachedDisplay = display
+        gearsByPos[pos] = entry
+        tagDisplay(display, entry)
+
+        val refNet = networks[refEntry.networkId]
+        if (refNet != null) assignToNetwork(entry, refNet, refEntry.speedMultiplier)
+        belt.axlePositions.add(pos)
+        return true
     }
 
     // ─── Network logic ───────────────────────────────────────────────────────
@@ -379,6 +549,12 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
                         }
                         queue.add(nPos to nextMult)
                     }
+                }
+                // Belt connections: axles in the same belt stay linked at 1:1 ratio.
+                // Entries for a detached belt are already removed from beltsByAxle before
+                // rebuildNetworks is called, so this only follows belts that still exist.
+                beltsByAxle[cur]?.axlePositions?.forEach { bPos ->
+                    if (bPos !in visited && bPos in remaining) queue.add(bPos to mult)
                 }
             }
         }
@@ -1053,6 +1229,22 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         val stack = ItemStack(Material.STICK)
         val meta: ItemMeta = stack.itemMeta ?: return stack
         meta.setItemModel(modelKey)
+        stack.itemMeta = meta
+        return stack
+    }
+
+    private fun beltSpinItem(): ItemStack {
+        val stack = ItemStack(Material.STICK)
+        val meta: ItemMeta = stack.itemMeta ?: return stack
+        meta.setItemModel(NamespacedKey("ssggearmachine", "parts/esteira_spin"))
+        stack.itemMeta = meta
+        return stack
+    }
+
+    private fun beltFixedItem(): ItemStack {
+        val stack = ItemStack(Material.STICK)
+        val meta: ItemMeta = stack.itemMeta ?: return stack
+        meta.setItemModel(NamespacedKey("ssggearmachine", "parts/esteira_fixed"))
         stack.itemMeta = meta
         return stack
     }
