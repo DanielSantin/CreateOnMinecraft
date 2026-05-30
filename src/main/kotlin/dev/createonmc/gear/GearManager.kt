@@ -39,6 +39,7 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         private const val BELT_ITEM_SCALE     = 0.5f
         private const val BELT_SPEED_FACTOR   = 0.02f   // baseDpt × factor = blocks/tick (~1 blk/s at 10 RPM)
         private const val BELT_ITEM_SPACING   = 1.0f    // minimum blocks between item centres
+        private const val BELT_INTERP_TICKS   = 2       // interpolation ticks for normal belt movement
     }
 
     // Barrier block offsets relative to gear origin — all types get 1 barrier at (0,0,0).
@@ -52,6 +53,9 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
     private val beltsByAxle = mutableMapOf<AxlePos, BeltEntry>()
     private var nextNetworkId = 0
     private var tickCount = 0
+    // Belt restoration is debounced: fires 20 ticks after the last chunk load so all
+    // adjacent chunks (and their gear entities) are ready before we try to re-attach.
+    private var pendingBeltRestoreTaskId = -1
 
     // ─── PDC keys (stored on the ItemDisplay entity for persistence) ────────
     private val pdcGearType    = NamespacedKey(plugin, "gear_type")
@@ -64,6 +68,11 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
     private val pdcBY          = NamespacedKey(plugin, "by")
     private val pdcBZ          = NamespacedKey(plugin, "bz")
     private val pdcWorldName   = NamespacedKey(plugin, "world_name")
+    // Belt persistence PDC keys
+    private val pdcBeltEndB      = NamespacedKey(plugin, "belt_end_b")       // on posA display: "bx,by,bz" of posB
+    private val pdcBeltFixedPosA = NamespacedKey(plugin, "belt_fixed_posa")  // on esteira_fixed: "wN,bx,by,bz" of posA
+    private val pdcBeltItemPosA  = NamespacedKey(plugin, "belt_item_posa")   // on belt item display: "wN,bx,by,bz" of posA
+    private val pdcBeltItemStack = NamespacedKey(plugin, "belt_item_stack")  // on belt item display: "MAT:amount"
     // Millstone inventory PDC keys
     private val pdcMsInputType  = NamespacedKey(plugin, "ms_input_type")
     private val pdcMsInputCount = NamespacedKey(plugin, "ms_input_count")
@@ -362,10 +371,28 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         val belt = BeltEntry(allPositions, axlePositions, fixedUuids, mergedNetworkId)
         for (pos in allPositions) beltsByAxle[pos] = belt
 
+        // ── Persist belt metadata on display entities ─────────────────────────
+        val eA = gearsByPos[posA]!!
+        val dispA: ItemDisplay? = eA.cachedDisplay?.takeIf { it.isValid }
+            ?: plugin.server.getEntity(eA.displayUuid) as? ItemDisplay
+        if (dispA != null) {
+            dispA.persistentDataContainer.set(
+                pdcBeltEndB, PersistentDataType.STRING, "${posB.bx},${posB.by},${posB.bz}")
+        } else {
+            plugin.logger.warning("[Belt] Could not tag posA entity for persistence at $posA")
+        }
+
+        // Each esteira_fixed: stores posA so we can collect their UUIDs on reload
+        val posATag = "${posA.worldName},${posA.bx},${posA.by},${posA.bz}"
+        fixedUuids.forEach { uuid ->
+            (plugin.server.getEntity(uuid) as? ItemDisplay)
+                ?.persistentDataContainer?.set(pdcBeltFixedPosA, PersistentDataType.STRING, posATag)
+        }
+
         return true
     }
 
-    fun detachBelt(pos: AxlePos) {
+    fun detachBelt(pos: AxlePos, clearPersistence: Boolean = true) {
         val belt = beltsByAxle[pos] ?: return
         val worldName = belt.allPositions.firstOrNull()?.worldName ?: return
         val world = plugin.server.getWorld(worldName) ?: return
@@ -382,6 +409,14 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
             (beltItem.cachedDisplay ?: plugin.server.getEntity(beltItem.displayUuid))?.remove()
         }
         belt.items.clear()
+
+        // Clear belt persistence tag from posA's gear display (only when player actively breaks the belt)
+        if (clearPersistence) {
+            gearsByPos[posA]?.let { e ->
+                (e.cachedDisplay ?: plugin.server.getEntity(e.displayUuid) as? ItemDisplay)
+                    ?.persistentDataContainer?.remove(pdcBeltEndB)
+            }
+        }
 
         // Remove esteira_fixed displays
         belt.fixedDisplayUuids.forEach { plugin.server.getEntity(it)?.remove() }
@@ -514,20 +549,22 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
                     val nSX = when { nB2.bx > nA.bx -> 1; nB2.bx < nA.bx -> -1; else -> 0 }
                     val nSZ = when { nB2.bz > nA.bz -> 1; nB2.bz < nA.bz -> -1; else -> 0 }
                     // Reuse the display entity for a smooth transition instead of delete+recreate.
-                    // teleportDuration smooths the anchor position change (1 block in new direction).
-                    // interpolationDuration smooths the rotation change + translation reset.
+                    // Both durations match normal belt interpolation (2 ticks) for consistent speed.
                     val disp = item.cachedDisplay?.takeIf { it.isValid }
                         ?: plugin.server.getEntity(item.displayUuid) as? ItemDisplay
                     if (disp != null) {
-                        disp.teleportDuration = 3
+                        disp.teleportDuration = 2
                         disp.teleport(Location(world, nA.bx + 0.5, nA.by + 0.5, nA.bz + 0.5))
-                        disp.interpolationDuration = 3
+                        disp.interpolationDuration = 2
                         disp.interpolationDelay = 0
                         disp.transformation = Transformation(
                             Vector3f(entryPos * nSX, BELT_ITEM_Y_OFFSET, entryPos * nSZ),
                             beltItemRotation(nSX, nSZ),
                             Vector3f(BELT_ITEM_SCALE, BELT_ITEM_SCALE, BELT_ITEM_SCALE), IDENTITY_Q
                         )
+                        // Update persistence tag: anchor is now nA
+                        disp.persistentDataContainer.set(pdcBeltItemPosA, PersistentDataType.STRING,
+                            "${nA.worldName},${nA.bx},${nA.by},${nA.bz}")
                         item.beltPos = entryPos
                         item.cachedDisplay = disp
                         toRemove.add(item)
@@ -661,6 +698,12 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
             )
         }
         display.setItemStack(item)
+        // Tag for persistence: posA lets us locate the belt on reload; stack encodes what the item is.
+        // beltPos is reconstructed from the transformation translation (persisted in entity NBT).
+        val posATag = "${posA.worldName},${posA.bx},${posA.by},${posA.bz}"
+        display.persistentDataContainer.set(pdcBeltItemPosA,  PersistentDataType.STRING, posATag)
+        display.persistentDataContainer.set(pdcBeltItemStack, PersistentDataType.STRING,
+            "${item.type.name}:${item.amount}")
         return BeltItem(display.uniqueId, item.clone(), beltPos).also { it.cachedDisplay = display }
     }
 
@@ -689,17 +732,10 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
      *  +Z       │   0°   (default)
      *  -Z       │ +180°
      */
-    private fun beltItemRotation(stepX: Int, stepZ: Int): Quaternionf {
-        val flatQ = RotationUtil.axisAngle(1f, 0f, 0f, -90f)
-        val yDeg  = when {
-            stepX > 0 ->  90f
-            stepX < 0 -> -90f
-            stepZ < 0 -> 180f
-            else      ->   0f
-        }
-        return if (yDeg == 0f) Quaternionf(flatQ)
-               else Quaternionf(RotationUtil.axisAngle(0f, 1f, 0f, yDeg)).mul(flatQ)
-    }
+    // Fixed rotation: item always lies flat regardless of belt direction.
+    // Removing Y-axis rotation eliminates the 90° spin artefact at L-connections.
+    private fun beltItemRotation(stepX: Int, stepZ: Int): Quaternionf =
+        RotationUtil.axisAngle(1f, 0f, 0f, -90f)
 
     // ─── Network logic ───────────────────────────────────────────────────────
 
@@ -1198,6 +1234,150 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
                     entity.persistentDataContainer.has(pdcGearType, PersistentDataType.STRING) &&
                     restoreDisplay(entity)) count++
         if (count > 0) plugin.logger.info("Restored $count gear(s) from loaded chunks.")
+        // Belt restore is deferred — actual chunk entities arrive via ChunkLoadEvent,
+        // so restoreBeltsFromWorld() is called (debounced) from restoreFromChunk() instead.
+    }
+
+    private fun restoreBeltsFromWorld() {
+        // Single pass: bucket entities by their belt role
+        // posA displays  → list of (posA → entity) to reconstruct belts
+        // esteira_fixed  → grouped by posA for UUID collection
+        // belt items     → grouped by posA to re-attach to restored belts
+        data class ItemInfo(val display: ItemDisplay, val stack: org.bukkit.inventory.ItemStack)
+
+        val posADisplays   = mutableMapOf<AxlePos, ItemDisplay>()
+        val fixedByPosA    = mutableMapOf<AxlePos, MutableList<UUID>>()
+        val itemsByPosA    = mutableMapOf<AxlePos, MutableList<ItemInfo>>()
+
+        for (world in plugin.server.worlds) {
+            for (entity in world.entities) {
+                if (entity !is ItemDisplay) continue
+                val pdc = entity.persistentDataContainer
+
+                // Belt posA gear display — has belt_end_b AND the standard gear PDC keys
+                if (pdc.has(pdcBeltEndB, PersistentDataType.STRING)) {
+                    val bx = pdc.get(pdcBX, PersistentDataType.INTEGER) ?: continue
+                    val by = pdc.get(pdcBY, PersistentDataType.INTEGER) ?: continue
+                    val bz = pdc.get(pdcBZ, PersistentDataType.INTEGER) ?: continue
+                    val wn = pdc.get(pdcWorldName, PersistentDataType.STRING) ?: continue
+                    posADisplays[AxlePos(wn, bx, by, bz)] = entity
+                    continue
+                }
+
+                // esteira_fixed display — has belt_fixed_posa
+                val fixedTag = pdc.get(pdcBeltFixedPosA, PersistentDataType.STRING)
+                if (fixedTag != null) {
+                    parseAxlePos(fixedTag)?.let { posA ->
+                        fixedByPosA.getOrPut(posA) { mutableListOf() }.add(entity.uniqueId)
+                    }
+                    continue
+                }
+
+                // Belt item display — has belt_item_posa + belt_item_stack
+                val itemPosATag = pdc.get(pdcBeltItemPosA, PersistentDataType.STRING) ?: continue
+                val stackStr    = pdc.get(pdcBeltItemStack, PersistentDataType.STRING) ?: continue
+                val posA        = parseAxlePos(itemPosATag) ?: continue
+                val stackParts  = stackStr.split(":")
+                if (stackParts.size < 2) continue
+                val mat    = runCatching { Material.valueOf(stackParts[0]) }.getOrNull() ?: continue
+                val amount = stackParts[1].toIntOrNull() ?: 1
+                itemsByPosA.getOrPut(posA) { mutableListOf() }
+                    .add(ItemInfo(entity, org.bukkit.inventory.ItemStack(mat, amount)))
+            }
+        }
+
+        plugin.logger.info("[Belt] Restore scan: ${posADisplays.size} belt posA(s), " +
+            "${fixedByPosA.size} fixed group(s), ${itemsByPosA.size} item group(s)")
+
+        // Re-attach belts
+        var beltCount = 0
+        for ((posA, dispA) in posADisplays) {
+            if (beltsByAxle.containsKey(posA)) continue
+            val endBStr = dispA.persistentDataContainer.get(pdcBeltEndB, PersistentDataType.STRING) ?: continue
+            val parts   = endBStr.split(",")
+            if (parts.size < 3) continue
+            runCatching {
+                val posB = AxlePos(posA.worldName, parts[0].toInt(), parts[1].toInt(), parts[2].toInt())
+                val fixedUuids = fixedByPosA[posA] ?: mutableListOf()
+                val ok = restoreBelt(posA, posB, fixedUuids)
+                if (ok) beltCount++
+                else plugin.logger.warning("[Belt] restoreBelt failed: posA=$posA posB=$posB " +
+                    "entryA=${gearsByPos[posA]?.gearType} entryB=${gearsByPos[posB]?.gearType}")
+            }.onFailure { e ->
+                plugin.logger.warning("[Belt] Exception restoring belt at $posA: ${e.message}")
+            }
+        }
+
+        // Re-attach belt items to restored belts.
+        // beltPos is derived from the entity's own transformation translation (persisted in NBT).
+        for ((posA, infos) in itemsByPosA) {
+            val belt = beltsByAxle[posA] ?: continue
+            val beltPosB = belt.allPositions.last()
+            val stepX = when { beltPosB.bx > posA.bx -> 1; beltPosB.bx < posA.bx -> -1; else -> 0 }
+            val stepZ = when { beltPosB.bz > posA.bz -> 1; beltPosB.bz < posA.bz -> -1; else -> 0 }
+            for ((disp, item) in infos) {
+                val t = disp.transformation.translation
+                // beltPos = dot(translation, step) since only one axis is nonzero
+                val beltPos = (t.x * stepX + t.z * stepZ).coerceIn(0f, (belt.allPositions.size - 1).toFloat())
+                val beltItem = BeltItem(disp.uniqueId, item, beltPos)
+                beltItem.cachedDisplay = disp
+                belt.items.add(beltItem)
+            }
+        }
+
+        if (beltCount > 0)
+            plugin.logger.info("Restored $beltCount belt(s) from loaded chunks.")
+    }
+
+    private fun restoreBelt(posA: AxlePos, posB: AxlePos, fixedUuids: List<UUID>): Boolean {
+        val entryA = gearsByPos[posA] ?: return false
+        val entryB = gearsByPos[posB] ?: return false
+        if (entryA.gearType != GearType.AXLE || entryB.gearType != GearType.AXLE) return false
+
+        val deltaX = posB.bx - posA.bx; val deltaZ = posB.bz - posA.bz
+        if (deltaX != 0 && deltaZ != 0) return false
+        val dist  = kotlin.math.abs(deltaX) + kotlin.math.abs(deltaZ)
+        val stepX = if (deltaX != 0) deltaX / kotlin.math.abs(deltaX) else 0
+        val stepZ = if (deltaZ != 0) deltaZ / kotlin.math.abs(deltaZ) else 0
+
+        val allPositions  = mutableListOf<AxlePos>()
+        val axlePositions = mutableSetOf<AxlePos>()
+        for (i in 0..dist) {
+            val pos = AxlePos(posA.worldName, posA.bx + stepX * i, posA.by, posA.bz + stepZ * i)
+            allPositions.add(pos)
+            if (gearsByPos.containsKey(pos)) axlePositions.add(pos)
+        }
+
+        // Restore esteira_spin on axle displays
+        val spinItem = beltSpinItem()
+        for (pos in axlePositions) {
+            val e = gearsByPos[pos] ?: continue
+            (e.cachedDisplay ?: plugin.server.getEntity(e.displayUuid) as? ItemDisplay)
+                ?.setItemStack(spinItem)
+        }
+
+        // Merge all axle networks
+        var primaryNet: GearNetwork? = null
+        for (pos in axlePositions) {
+            val e = gearsByPos[pos] ?: continue
+            val net = networks[e.networkId] ?: continue
+            if (primaryNet == null) { primaryNet = net }
+            else if (net !== primaryNet) {
+                val refMult = gearsByPos[posA]?.speedMultiplier ?: 1f
+                val correction = if (e.speedMultiplier != 0f) refMult / e.speedMultiplier else 1f
+                mergeInto(primaryNet!!, net, correction)
+            }
+        }
+
+        val belt = BeltEntry(allPositions, axlePositions, fixedUuids.toMutableList(), primaryNet?.id ?: -1)
+        for (pos in allPositions) beltsByAxle[pos] = belt
+        return true
+    }
+
+    private fun parseAxlePos(s: String): AxlePos? {
+        val p = s.split(",")
+        if (p.size < 4) return null
+        return runCatching { AxlePos(p[0], p[1].toInt(), p[2].toInt(), p[3].toInt()) }.getOrNull()
     }
 
     /** Scans a newly loaded chunk (called by ChunkLoadEvent). */
@@ -1208,6 +1388,16 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
                 entity.persistentDataContainer.has(pdcGearType, PersistentDataType.STRING) &&
                 restoreDisplay(entity)) count++
         if (count > 0) plugin.logger.info("Restored $count gear(s) from chunk (${chunk.x}, ${chunk.z}).")
+
+        // Debounce belt restoration: reset the 20-tick countdown each time a chunk loads.
+        // This ensures all adjacent chunks (and their gear entities) are in memory before
+        // we try to re-attach belts. Without this, restoreBeltsFromWorld runs too early.
+        if (pendingBeltRestoreTaskId != -1)
+            plugin.server.scheduler.cancelTask(pendingBeltRestoreTaskId)
+        pendingBeltRestoreTaskId = plugin.server.scheduler.runTaskLater(plugin, Runnable {
+            pendingBeltRestoreTaskId = -1
+            restoreBeltsFromWorld()
+        }, 20L).taskId
     }
 
     // ─── Water wheel ─────────────────────────────────────────────────────────
@@ -1294,7 +1484,7 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
             if (display == null || !display.isValid) dead.add(entry.pos)
         }
         dead.forEach { pos ->
-            detachBelt(pos)   // clean up belt state + gap barriers before removing gear entry
+            detachBelt(pos, clearPersistence = false)  // clean up in-memory state; keep PDC so belt can be restored on reload
             val e = gearsByPos.remove(pos) ?: return@forEach
             e.extraDisplayUuids.forEach { plugin.server.getEntity(it)?.remove() }
             millstoneData.remove(pos)
