@@ -16,3 +16,6 @@ commands:
   ssgitem:
     description: Give a preview display item for texture testing
     usage: /ssgitem <model_id>
+  ssgclear:
+    description: Remove all Create entities and barriers in a world
+    usage: /ssgclear [world]

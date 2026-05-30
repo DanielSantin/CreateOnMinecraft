@@ -262,6 +262,10 @@ class AxleInteractListener(
         }
 
         gearManager.removeGear(block.world, block.x, block.y, block.z, dropItem = true)
+
+        // Fallback: if the barrier is still there after removeGear (orphaned — no tracked entry),
+        // just remove it so players are never stuck with an unbreakable block.
+        if (block.type == Material.BARRIER) block.type = Material.AIR
     }
 
     private fun heldGearType(player: Player): GearType? {

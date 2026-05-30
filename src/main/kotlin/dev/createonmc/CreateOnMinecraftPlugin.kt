@@ -1,6 +1,7 @@
 package dev.createonmc
 
 import dev.createonmc.commands.GearStressCommand
+import dev.createonmc.commands.SSGClearCommand
 import dev.createonmc.commands.SSGGiveCommand
 import dev.createonmc.commands.SSGItemCommand
 import dev.createonmc.gear.GearManager
@@ -26,6 +27,9 @@ class CreateOnMinecraftPlugin : JavaPlugin() {
         getCommand("ssggive")?.tabCompleter = ssgGive
         getCommand("gearstress")?.setExecutor(stressCommand)
         getCommand("ssgitem")?.setExecutor(ssgItemCommand)
+        val ssgClear = SSGClearCommand(gearManager)
+        getCommand("ssgclear")?.setExecutor(ssgClear)
+        getCommand("ssgclear")?.tabCompleter = ssgClear
         logger.info("CreateOnMinecraft enabled!")
     }
 

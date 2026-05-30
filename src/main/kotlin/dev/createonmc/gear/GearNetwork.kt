@@ -12,4 +12,7 @@ class GearNetwork(val id: Int) {
     var stressCapacity: Float = 0f
     var stressImpact:   Float = 0f
     val isOverstressed get() = stressImpact > stressCapacity && stressCapacity > 0f
+
+    /** Cached baseDpt from the last step; read by belt item transport every tick. */
+    var lastBaseDpt: Float = 0f
 }

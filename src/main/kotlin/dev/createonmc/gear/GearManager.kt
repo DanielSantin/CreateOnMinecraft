@@ -33,6 +33,12 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         const val STRESS_IMPACT_MILLSTONE     = 4f    // SU consumed per RPM
         private const val TICKS_PER_MINUTE    = 20f * 60f
         private const val DPT_TO_RPM          = TICKS_PER_MINUTE / 360f  // multiply dpt → rpm
+
+        // ── Belt item transport ───────────────────────────────────────────────
+        private const val BELT_ITEM_Y_OFFSET  = 0.375f  // entity at by+0.5 → item center at by+0.875 (14/16)
+        private const val BELT_ITEM_SCALE     = 0.5f
+        private const val BELT_SPEED_FACTOR   = 0.02f   // baseDpt × factor = blocks/tick (~1 blk/s at 10 RPM)
+        private const val BELT_ITEM_SPACING   = 1.0f    // minimum blocks between item centres
     }
 
     // Barrier block offsets relative to gear origin — all types get 1 barrier at (0,0,0).
@@ -364,6 +370,19 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         val worldName = belt.allPositions.firstOrNull()?.worldName ?: return
         val world = plugin.server.getWorld(worldName) ?: return
 
+        // Drop all in-transit items back into the world
+        val posA = belt.allPositions.first()
+        val posB = belt.allPositions.last()
+        val stepX = when { posB.bx > posA.bx -> 1; posB.bx < posA.bx -> -1; else -> 0 }
+        val stepZ = when { posB.bz > posA.bz -> 1; posB.bz < posA.bz -> -1; else -> 0 }
+        for (beltItem in belt.items) {
+            val px = posA.bx + 0.5 + beltItem.beltPos * stepX
+            val pz = posA.bz + 0.5 + beltItem.beltPos * stepZ
+            world.dropItemNaturally(Location(world, px, posA.by + 0.875, pz), beltItem.item.clone())
+            (beltItem.cachedDisplay ?: plugin.server.getEntity(beltItem.displayUuid))?.remove()
+        }
+        belt.items.clear()
+
         // Remove esteira_fixed displays
         belt.fixedDisplayUuids.forEach { plugin.server.getEntity(it)?.remove() }
 
@@ -418,6 +437,268 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         if (refNet != null) assignToNetwork(entry, refNet, refEntry.speedMultiplier)
         belt.axlePositions.add(pos)
         return true
+    }
+
+    // ─── Belt item transport ─────────────────────────────────────────────────
+
+    private fun tickBelts() {
+        val seen = mutableSetOf<BeltEntry>()
+        for (belt in beltsByAxle.values) if (seen.add(belt)) tickBelt(belt)
+    }
+
+    private fun tickBelt(belt: BeltEntry) {
+        val posA = belt.allPositions.firstOrNull() ?: return
+        val posB = belt.allPositions.lastOrNull() ?: return
+        val dist = belt.allPositions.size - 1
+        if (dist == 0) return
+        val world = plugin.server.getWorld(posA.worldName) ?: return
+
+        val stepX = when { posB.bx > posA.bx -> 1; posB.bx < posA.bx -> -1; else -> 0 }
+        val stepZ = when { posB.bz > posA.bz -> 1; posB.bz < posA.bz -> -1; else -> 0 }
+
+        if (tickCount % 4 == 0) pickupItemEntities(world, belt, posA, stepX, stepZ)
+        if (tickCount % 8 == 0) tickBeltHoppers(world, belt, posA, stepX, stepZ)
+
+        val refEntry = gearsByPos[belt.axlePositions.firstOrNull() ?: return] ?: return
+        val baseDpt  = networks[refEntry.networkId]?.lastBaseDpt ?: 0f
+
+        // Signed speed: positive → items move A→B, negative → B→A.
+        // Physics: surface velocity at top of shaft = ω × (0,r,0).
+        //   X-axis shaft: v = (0,0,ωr)  → +Z at positive ω  → dirSign = stepZ
+        //   Z-axis shaft: v = (-ωr,0,0) → -X at positive ω  → dirSign = -stepX
+        //   Y-axis shaft: v = (+ωr,0,0) or (0,0,-ωr)        → dirSign = stepX-stepZ
+        val dirSign = when (refEntry.axis) {
+            AxleAxis.X -> stepZ.toFloat()
+            AxleAxis.Z -> -stepX.toFloat()
+            AxleAxis.Y -> (stepX - stepZ).toFloat()
+        }
+        val signedSpeed = baseDpt * refEntry.speedMultiplier * dirSign * BELT_SPEED_FACTOR
+        if (signedSpeed == 0f || belt.items.isEmpty()) return
+
+        val speed   = kotlin.math.abs(signedSpeed)
+        val forward = signedSpeed > 0f   // true = A→B, false = B→A
+
+        // "Exit" end and direction for end-of-belt and belt-chain checks
+        val endPos   = if (forward) posB  else posA
+        val endBeltP = if (forward) dist.toFloat() else 0f
+        val exitX    = if (forward) stepX else -stepX
+        val exitZ    = if (forward) stepZ else -stepZ
+
+        // Sort so "frontmost" items (closest to exit) come first in the list
+        if (forward) belt.items.sortByDescending { it.beltPos } else belt.items.sortBy { it.beltPos }
+        val toRemove = mutableListOf<BeltItem>()
+
+        for (i in belt.items.indices) {
+            val item = belt.items[i]
+            if (item in toRemove) continue
+
+            val atEnd = if (forward) item.beltPos >= endBeltP else item.beltPos <= endBeltP
+            if (atEnd) {
+                // Try connecting belt: straight, left turn, right turn relative to exit direction
+                val candidates = listOf(
+                    AxlePos(posA.worldName, endPos.bx + exitX,  endPos.by, endPos.bz + exitZ),
+                    AxlePos(posA.worldName, endPos.bx - exitZ,  endPos.by, endPos.bz + exitX),
+                    AxlePos(posA.worldName, endPos.bx + exitZ,  endPos.by, endPos.bz - exitX),
+                )
+                var transferred = false
+                var nextBeltFound = false
+                for (candidate in candidates) {
+                    val nextBelt = beltsByAxle[candidate] ?: continue
+                    if (nextBelt === belt) continue
+                    nextBeltFound = true
+                    val entryIdx = nextBelt.allPositions.indexOf(candidate)
+                    if (entryIdx < 0) continue
+                    val entryPos = entryIdx.toFloat()
+                    if (nextBelt.items.any { kotlin.math.abs(it.beltPos - entryPos) < BELT_ITEM_SPACING }) continue
+                    val nA = nextBelt.allPositions.first(); val nB2 = nextBelt.allPositions.last()
+                    val nSX = when { nB2.bx > nA.bx -> 1; nB2.bx < nA.bx -> -1; else -> 0 }
+                    val nSZ = when { nB2.bz > nA.bz -> 1; nB2.bz < nA.bz -> -1; else -> 0 }
+                    // Reuse the display entity for a smooth transition instead of delete+recreate.
+                    // teleportDuration smooths the anchor position change (1 block in new direction).
+                    // interpolationDuration smooths the rotation change + translation reset.
+                    val disp = item.cachedDisplay?.takeIf { it.isValid }
+                        ?: plugin.server.getEntity(item.displayUuid) as? ItemDisplay
+                    if (disp != null) {
+                        disp.teleportDuration = 3
+                        disp.teleport(Location(world, nA.bx + 0.5, nA.by + 0.5, nA.bz + 0.5))
+                        disp.interpolationDuration = 3
+                        disp.interpolationDelay = 0
+                        disp.transformation = Transformation(
+                            Vector3f(entryPos * nSX, BELT_ITEM_Y_OFFSET, entryPos * nSZ),
+                            beltItemRotation(nSX, nSZ),
+                            Vector3f(BELT_ITEM_SCALE, BELT_ITEM_SCALE, BELT_ITEM_SCALE), IDENTITY_Q
+                        )
+                        item.beltPos = entryPos
+                        item.cachedDisplay = disp
+                        toRemove.add(item)
+                        nextBelt.items.add(item)
+                    } else {
+                        toRemove.add(item)
+                        nextBelt.items.add(spawnBeltItem(world, nA, nSX, nSZ, item.item.clone(), entryPos))
+                    }
+                    transferred = true
+                    break
+                }
+                if (transferred || nextBeltFound) continue
+
+                val endBlock = world.getBlockAt(endPos.bx + exitX, endPos.by, endPos.bz + exitZ)
+                if (!endBlock.type.isSolid) {
+                    world.dropItemNaturally(
+                        Location(world, endPos.bx + exitX + 0.5, endPos.by + 0.875, endPos.bz + exitZ + 0.5),
+                        item.item.clone()
+                    )
+                    (item.cachedDisplay ?: plugin.server.getEntity(item.displayUuid))?.remove()
+                    toRemove.add(item)
+                }
+                continue
+            }
+
+            // i-1 is frontmost (sorted above), so it is the "item ahead"
+            val frontItem = if (i > 0 && belt.items[i - 1] !in toRemove) belt.items[i - 1] else null
+
+            val advance = if (frontItem != null) {
+                val gap = if (forward) frontItem.beltPos - item.beltPos
+                          else        item.beltPos - frontItem.beltPos
+                if (gap <= BELT_ITEM_SPACING) 0f else minOf(speed, gap - BELT_ITEM_SPACING)
+            } else {
+                val wouldPassEnd = if (forward) item.beltPos + speed >= endBeltP
+                                   else         item.beltPos - speed <= endBeltP
+                if (wouldPassEnd) {
+                    val hasNextBelt = listOf(
+                        AxlePos(posA.worldName, endPos.bx + exitX, endPos.by, endPos.bz + exitZ),
+                        AxlePos(posA.worldName, endPos.bx - exitZ, endPos.by, endPos.bz + exitX),
+                        AxlePos(posA.worldName, endPos.bx + exitZ, endPos.by, endPos.bz - exitX),
+                    ).any { c -> beltsByAxle[c]?.let { it !== belt } == true }
+                    if (hasNextBelt) speed
+                    else {
+                        val endBlock = world.getBlockAt(endPos.bx + exitX, endPos.by, endPos.bz + exitZ)
+                        if (endBlock.type.isSolid) {
+                            val remaining = if (forward) endBeltP - item.beltPos else item.beltPos - endBeltP
+                            remaining.coerceAtLeast(0f)
+                        } else speed
+                    }
+                } else speed
+            }
+
+            if (advance > 0f) {
+                val newPos = if (forward) item.beltPos + advance else item.beltPos - advance
+                item.beltPos = if (forward) newPos.coerceAtMost(endBeltP) else newPos.coerceAtLeast(endBeltP)
+                updateBeltItemDisplay(item, posA, stepX, stepZ)
+            }
+        }
+
+        belt.items.removeAll(toRemove.toSet())
+    }
+
+    private fun pickupItemEntities(world: World, belt: BeltEntry, posA: AxlePos, stepX: Int, stepZ: Int) {
+        for ((index, pos) in belt.allPositions.withIndex()) {
+            val slotPos = index.toFloat()
+            if (belt.items.any { kotlin.math.abs(it.beltPos - slotPos) < 0.5f }) continue
+            val nearby = world.getNearbyEntities(
+                Location(world, pos.bx + 0.5, pos.by + 1.25, pos.bz + 0.5), 0.45, 0.45, 0.45
+            ).filterIsInstance<org.bukkit.entity.Item>()
+            if (nearby.isEmpty()) continue
+            belt.items.add(spawnBeltItem(world, posA, stepX, stepZ, nearby.first().itemStack.clone(), slotPos))
+            nearby.first().remove()
+        }
+    }
+
+    private fun tickBeltHoppers(world: World, belt: BeltEntry, posA: AxlePos, stepX: Int, stepZ: Int) {
+        for ((index, pos) in belt.allPositions.withIndex()) {
+            val slotPos = index.toFloat()
+            if (belt.items.any { kotlin.math.abs(it.beltPos - slotPos) < 0.5f }) continue
+
+            // Hopper above facing DOWN
+            if (tryHopperInsert(world.getBlockAt(pos.bx, pos.by + 1, pos.bz),
+                    org.bukkit.block.BlockFace.DOWN, world, belt, posA, stepX, stepZ, slotPos)) continue
+
+            // Hoppers from four sides
+            for ((dx, dz, face) in listOf(
+                Triple( 1,  0, org.bukkit.block.BlockFace.WEST),
+                Triple(-1,  0, org.bukkit.block.BlockFace.EAST),
+                Triple( 0,  1, org.bukkit.block.BlockFace.NORTH),
+                Triple( 0, -1, org.bukkit.block.BlockFace.SOUTH)
+            )) {
+                if (tryHopperInsert(world.getBlockAt(pos.bx + dx, pos.by, pos.bz + dz),
+                        face, world, belt, posA, stepX, stepZ, slotPos)) break
+            }
+        }
+    }
+
+    private fun tryHopperInsert(
+        block: org.bukkit.block.Block, requiredFacing: org.bukkit.block.BlockFace,
+        world: World, belt: BeltEntry, posA: AxlePos, stepX: Int, stepZ: Int, slotPos: Float
+    ): Boolean {
+        if (block.type != Material.HOPPER) return false
+        val data = block.blockData as? org.bukkit.block.data.type.Hopper ?: return false
+        if (data.facing != requiredFacing) return false
+        val inv = (block.state as? org.bukkit.block.Hopper)?.inventory ?: return false
+        for (i in 0 until inv.size) {
+            val stack = inv.getItem(i) ?: continue
+            if (stack.type.isAir) continue
+            val transfer = stack.clone().also { it.amount = 1 }
+            stack.amount -= 1
+            inv.setItem(i, if (stack.amount <= 0) null else stack)
+            belt.items.add(spawnBeltItem(world, posA, stepX, stepZ, transfer, slotPos))
+            return true
+        }
+        return false
+    }
+
+    private fun spawnBeltItem(
+        world: World, posA: AxlePos, stepX: Int, stepZ: Int,
+        item: ItemStack, beltPos: Float
+    ): BeltItem {
+        val loc = Location(world, posA.bx + 0.5, posA.by + 0.5, posA.bz + 0.5)
+        val display = world.spawn(loc, ItemDisplay::class.java) { e ->
+            e.itemDisplayTransform = ItemDisplay.ItemDisplayTransform.NONE
+            e.interpolationDuration = 0
+            e.interpolationDelay   = 0
+            e.transformation = Transformation(
+                Vector3f(beltPos * stepX, BELT_ITEM_Y_OFFSET, beltPos * stepZ),
+                beltItemRotation(stepX, stepZ),
+                Vector3f(BELT_ITEM_SCALE, BELT_ITEM_SCALE, BELT_ITEM_SCALE), IDENTITY_Q
+            )
+        }
+        display.setItemStack(item)
+        return BeltItem(display.uniqueId, item.clone(), beltPos).also { it.cachedDisplay = display }
+    }
+
+    private fun updateBeltItemDisplay(item: BeltItem, posA: AxlePos, stepX: Int, stepZ: Int) {
+        val display = item.cachedDisplay?.takeIf { it.isValid }
+            ?: (plugin.server.getEntity(item.displayUuid) as? ItemDisplay)?.also { item.cachedDisplay = it }
+            ?: return
+        display.interpolationDuration = 2
+        display.interpolationDelay   = 0
+        display.transformation = Transformation(
+            Vector3f(item.beltPos * stepX, BELT_ITEM_Y_OFFSET, item.beltPos * stepZ),
+            beltItemRotation(stepX, stepZ),
+            Vector3f(BELT_ITEM_SCALE, BELT_ITEM_SCALE, BELT_ITEM_SCALE), IDENTITY_Q
+        )
+    }
+
+    /**
+     * Quaternion that makes an item lie flat on the belt surface, oriented along the belt direction.
+     * Derivation: rotate -90° around X (face visible from above), then rotate around Y to align
+     * with the belt travel direction.
+     *
+     * Belt dir  │ Y-angle
+     * ──────────┼────────
+     *  +X       │  +90°
+     *  -X       │  -90°
+     *  +Z       │   0°   (default)
+     *  -Z       │ +180°
+     */
+    private fun beltItemRotation(stepX: Int, stepZ: Int): Quaternionf {
+        val flatQ = RotationUtil.axisAngle(1f, 0f, 0f, -90f)
+        val yDeg  = when {
+            stepX > 0 ->  90f
+            stepX < 0 -> -90f
+            stepZ < 0 -> 180f
+            else      ->   0f
+        }
+        return if (yDeg == 0f) Quaternionf(flatQ)
+               else Quaternionf(RotationUtil.axisAngle(0f, 1f, 0f, yDeg)).mul(flatQ)
     }
 
     // ─── Network logic ───────────────────────────────────────────────────────
@@ -855,6 +1136,59 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         return true
     }
 
+    /** Removes every Create entity and barrier in [worldName]. Returns count of gears removed. */
+    fun clearWorld(worldName: String): Int {
+        val world = plugin.server.getWorld(worldName)
+        var count = 0
+
+        // 1. Detach all belts (removes esteira_fixed displays + gap barriers + belt items)
+        val beltsSeen = mutableSetOf<BeltEntry>()
+        for ((pos, belt) in beltsByAxle.toMap()) {
+            if (pos.worldName != worldName) continue
+            if (!beltsSeen.add(belt)) continue
+            belt.fixedDisplayUuids.forEach { plugin.server.getEntity(it)?.remove() }
+            belt.items.forEach {
+                (it.cachedDisplay ?: plugin.server.getEntity(it.displayUuid))?.remove()
+            }
+            world?.let { w ->
+                for (p in belt.allPositions) {
+                    if (p !in belt.axlePositions) {
+                        val block = w.getBlockAt(p.bx, p.by, p.bz)
+                        if (block.type == Material.BARRIER) block.type = Material.AIR
+                    }
+                }
+            }
+        }
+        beltsByAxle.entries.removeIf { it.key.worldName == worldName }
+
+        // 2. Remove all gear entities and their barrier colliders
+        for ((pos, entry) in gearsByPos.toMap()) {
+            if (pos.worldName != worldName) continue
+            (entry.cachedDisplay ?: plugin.server.getEntity(entry.displayUuid))?.remove()
+            entry.extraDisplayUuids.forEach { plugin.server.getEntity(it)?.remove() }
+            world?.let { removeColliders(it, pos.bx, pos.by, pos.bz, entry.gearType) }
+            count++
+        }
+        gearsByPos.entries.removeIf      { it.key.worldName == worldName }
+        millstoneData.entries.removeIf   { it.key.worldName == worldName }
+        networks.entries.removeIf        { (_, net) ->
+            net.members.keys.all { it.worldName == worldName }.also { allGone ->
+                if (allGone) net.members.clear()
+            }
+        }
+
+        // 3. Sweep for any stray Create ItemDisplay entities (PDC tag present)
+        world?.entities?.forEach { entity ->
+            if (entity is ItemDisplay &&
+                entity.persistentDataContainer.has(pdcGearType, PersistentDataType.STRING)) {
+                entity.remove()
+                count++
+            }
+        }
+
+        return count
+    }
+
     /** Scans loaded chunks on startup (called 1 tick after plugin enable). */
     fun restoreFromWorld() {
         var count = 0
@@ -952,6 +1286,7 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         tickCount++
         if (tickCount % 20 == 0) updateWaterWheelSpeeds()
         tickMillstones()
+        tickBelts()
 
         val dead = mutableListOf<AxlePos>()
         for ((_, entry) in gearsByPos) {
@@ -959,6 +1294,7 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
             if (display == null || !display.isValid) dead.add(entry.pos)
         }
         dead.forEach { pos ->
+            detachBelt(pos)   // clean up belt state + gap barriers before removing gear entry
             val e = gearsByPos.remove(pos) ?: return@forEach
             e.extraDisplayUuids.forEach { plugin.server.getEntity(it)?.remove() }
             millstoneData.remove(pos)
@@ -976,6 +1312,7 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
             if (--net.ticksLeft > 0) continue
 
             val baseDpt = networkEffectiveDpt(net)
+            net.lastBaseDpt = baseDpt
             if (baseDpt == 0f) continue
             val stepTicks = computeStepTicks(baseDpt, net)
             net.ticksLeft = stepTicks
