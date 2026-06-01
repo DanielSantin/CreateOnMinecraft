@@ -72,7 +72,7 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
     private val pdcBeltEndB      = NamespacedKey(plugin, "belt_end_b")       // on posA display: "bx,by,bz" of posB
     private val pdcBeltFixedPosA = NamespacedKey(plugin, "belt_fixed_posa")  // on esteira_fixed: "wN,bx,by,bz" of posA
     private val pdcBeltItemPosA  = NamespacedKey(plugin, "belt_item_posa")   // on belt item display: "wN,bx,by,bz" of posA
-    private val pdcBeltItemStack = NamespacedKey(plugin, "belt_item_stack")  // on belt item display: "MAT:amount"
+    private val pdcBeltItemStack = NamespacedKey(plugin, "belt_item_stack2") // on belt item display: full ItemStack bytes
     // Millstone inventory PDC keys
     private val pdcMsInputType  = NamespacedKey(plugin, "ms_input_type")
     private val pdcMsInputCount = NamespacedKey(plugin, "ms_input_count")
@@ -405,8 +405,9 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         for (beltItem in belt.items) {
             val px = posA.bx + 0.5 + beltItem.beltPos * stepX
             val pz = posA.bz + 0.5 + beltItem.beltPos * stepZ
+            (beltItem.cachedDisplay?.takeIf { it.isValid }
+                ?: plugin.server.getEntity(beltItem.displayUuid) as? ItemDisplay)?.remove()
             world.dropItemNaturally(Location(world, px, posA.by + 0.875, pz), beltItem.item.clone())
-            (beltItem.cachedDisplay ?: plugin.server.getEntity(beltItem.displayUuid))?.remove()
         }
         belt.items.clear()
 
@@ -496,6 +497,7 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
 
         val refEntry = gearsByPos[belt.axlePositions.firstOrNull() ?: return] ?: return
         val baseDpt  = networks[refEntry.networkId]?.lastBaseDpt ?: 0f
+        val beltTag  = "belt[${posA.bx},${posA.by},${posA.bz}→${posB.bx},${posB.bz}]"
 
         // Signed speed: positive → items move A→B, negative → B→A.
         // Physics: surface velocity at top of shaft = ω × (0,r,0).
@@ -512,6 +514,8 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
 
         val speed   = kotlin.math.abs(signedSpeed)
         val forward = signedSpeed > 0f   // true = A→B, false = B→A
+        if (belt.items.isNotEmpty())
+            plugin.logger.info("[BeltDBG] $beltTag tick=$tickCount items=${belt.items.size} speed=${"%.4f".format(speed)} forward=$forward")
 
         // "Exit" end and direction for end-of-belt and belt-chain checks
         val endPos   = if (forward) posB  else posA
@@ -523,99 +527,125 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         if (forward) belt.items.sortByDescending { it.beltPos } else belt.items.sortBy { it.beltPos }
         val toRemove = mutableListOf<BeltItem>()
 
+        // Adjacent positions that could be the start of a connected belt.
+        val exitCandidates = listOf(
+            AxlePos(posA.worldName, endPos.bx + exitX,  endPos.by, endPos.bz + exitZ),
+            AxlePos(posA.worldName, endPos.bx - exitZ,  endPos.by, endPos.bz + exitX),
+            AxlePos(posA.worldName, endPos.bx + exitZ,  endPos.by, endPos.bz - exitX),
+        )
+
         for (i in belt.items.indices) {
             val item = belt.items[i]
             if (item in toRemove) continue
 
-            val atEnd = if (forward) item.beltPos >= endBeltP else item.beltPos <= endBeltP
-            if (atEnd) {
-                // Try connecting belt: straight, left turn, right turn relative to exit direction
-                val candidates = listOf(
-                    AxlePos(posA.worldName, endPos.bx + exitX,  endPos.by, endPos.bz + exitZ),
-                    AxlePos(posA.worldName, endPos.bx - exitZ,  endPos.by, endPos.bz + exitX),
-                    AxlePos(posA.worldName, endPos.bx + exitZ,  endPos.by, endPos.bz - exitX),
-                )
-                var transferred = false
-                var nextBeltFound = false
-                for (candidate in candidates) {
-                    val nextBelt = beltsByAxle[candidate] ?: continue
-                    if (nextBelt === belt) continue
-                    nextBeltFound = true
-                    val entryIdx = nextBelt.allPositions.indexOf(candidate)
-                    if (entryIdx < 0) continue
-                    val entryPos = entryIdx.toFloat()
-                    if (nextBelt.items.any { kotlin.math.abs(it.beltPos - entryPos) < BELT_ITEM_SPACING }) continue
-                    val nA = nextBelt.allPositions.first(); val nB2 = nextBelt.allPositions.last()
-                    val nSX = when { nB2.bx > nA.bx -> 1; nB2.bx < nA.bx -> -1; else -> 0 }
-                    val nSZ = when { nB2.bz > nA.bz -> 1; nB2.bz < nA.bz -> -1; else -> 0 }
-                    // Reuse the display entity for a smooth transition instead of delete+recreate.
-                    // Both durations match normal belt interpolation (2 ticks) for consistent speed.
-                    val disp = item.cachedDisplay?.takeIf { it.isValid }
-                        ?: plugin.server.getEntity(item.displayUuid) as? ItemDisplay
-                    if (disp != null) {
-                        disp.teleportDuration = 2
-                        disp.teleport(Location(world, nA.bx + 0.5, nA.by + 0.5, nA.bz + 0.5))
-                        disp.interpolationDuration = 2
-                        disp.interpolationDelay = 0
-                        disp.transformation = Transformation(
-                            Vector3f(entryPos * nSX, BELT_ITEM_Y_OFFSET, entryPos * nSZ),
-                            beltItemRotation(nSX, nSZ),
-                            Vector3f(BELT_ITEM_SCALE, BELT_ITEM_SCALE, BELT_ITEM_SCALE), IDENTITY_Q
-                        )
-                        // Update persistence tag: anchor is now nA
-                        disp.persistentDataContainer.set(pdcBeltItemPosA, PersistentDataType.STRING,
-                            "${nA.worldName},${nA.bx},${nA.by},${nA.bz}")
-                        item.beltPos = entryPos
-                        item.cachedDisplay = disp
-                        toRemove.add(item)
-                        nextBelt.items.add(item)
-                    } else {
-                        toRemove.add(item)
-                        nextBelt.items.add(spawnBeltItem(world, nA, nSX, nSZ, item.item.clone(), entryPos))
-                    }
-                    transferred = true
-                    break
-                }
-                if (transferred || nextBeltFound) continue
+            val itemId = item.displayUuid.toString().takeLast(6)
 
-                val endBlock = world.getBlockAt(endPos.bx + exitX, endPos.by, endPos.bz + exitZ)
-                if (!endBlock.type.isSolid) {
-                    world.dropItemNaturally(
-                        Location(world, endPos.bx + exitX + 0.5, endPos.by + 0.875, endPos.bz + exitZ + 0.5),
-                        item.item.clone()
-                    )
-                    (item.cachedDisplay ?: plugin.server.getEntity(item.displayUuid))?.remove()
-                    toRemove.add(item)
+            // ── Phase 1: item has reached or passed the belt end ─────────────
+            val pastEnd = if (forward) item.beltPos >= endBeltP else item.beltPos <= endBeltP
+            if (pastEnd) {
+                plugin.logger.info("[BeltDBG]   item[$itemId] PAST_END beltPos=${"%.3f".format(item.beltPos)} endBeltP=$endBeltP")
+
+                // Find the first connected belt (straight, left, or right turn).
+                var nextBelt: BeltEntry? = null
+                var nextEntryIdx = 0
+                for (candidate in exitCandidates) {
+                    val nb = beltsByAxle[candidate] ?: continue
+                    if (nb === belt) continue
+                    val idx = nb.allPositions.indexOf(candidate)
+                    if (idx >= 0) { nextBelt = nb; nextEntryIdx = idx; break }
+                }
+                plugin.logger.info("[BeltDBG]   item[$itemId] nextBelt=${nextBelt != null} candidates=$exitCandidates")
+
+                // ── Phase 2: item has crossed the 1-block gap → instant swap ─
+                val gapLimit = if (forward) endBeltP + 1f else endBeltP - 1f
+                val crossedGap = if (forward) item.beltPos >= gapLimit else item.beltPos <= gapLimit
+
+                if (nextBelt != null && crossedGap) {
+                    val entryPos = nextEntryIdx.toFloat()
+                    val overshoot = if (forward) item.beltPos - gapLimit else gapLimit - item.beltPos
+                    val newBeltPos = entryPos + overshoot
+                    val blocked = nextBelt.items.any { kotlin.math.abs(it.beltPos - entryPos) < BELT_ITEM_SPACING }
+                    plugin.logger.info("[BeltDBG]   item[$itemId] TRANSFER→nextBelt newBeltPos=${"%.3f".format(newBeltPos)} blocked=$blocked")
+                    if (!blocked) {
+                        val nA  = nextBelt.allPositions.first()
+                        val nB2 = nextBelt.allPositions.last()
+                        val nSX = when { nB2.bx > nA.bx -> 1; nB2.bx < nA.bx -> -1; else -> 0 }
+                        val nSZ = when { nB2.bz > nA.bz -> 1; nB2.bz < nA.bz -> -1; else -> 0 }
+                        val disp = item.cachedDisplay?.takeIf { it.isValid }
+                            ?: plugin.server.getEntity(item.displayUuid) as? ItemDisplay
+                        if (disp != null) {
+                            disp.persistentDataContainer.set(pdcBeltItemPosA, PersistentDataType.STRING,
+                                "${nA.worldName},${nA.bx},${nA.by},${nA.bz}")
+                            item.beltPos = newBeltPos
+                            item.cachedDisplay = disp
+                            toRemove.add(item)
+                            nextBelt.items.add(item)
+                            updateBeltItemDisplay(item, nA, nSX, nSZ)
+                        } else {
+                            plugin.logger.warning("[BeltDBG]   item[$itemId] display entity MISSING at transfer, respawning")
+                            toRemove.add(item)
+                            nextBelt.items.add(spawnBeltItem(world, nA, nSX, nSZ, item.item.clone(), newBeltPos))
+                        }
+                    } else {
+                        plugin.logger.info("[BeltDBG]   item[$itemId] HOLD at gapLimit=${"%.3f".format(gapLimit)} (dest blocked)")
+                        item.beltPos = gapLimit
+                    }
+
+                } else if (nextBelt != null) {
+                    val entryPos = nextEntryIdx.toFloat()
+                    val destBlocked = nextBelt.items.any { kotlin.math.abs(it.beltPos - entryPos) < BELT_ITEM_SPACING }
+                    val advanceGap = if (forward) minOf(speed, gapLimit - item.beltPos).coerceAtLeast(0f)
+                                     else        minOf(speed, item.beltPos - gapLimit).coerceAtLeast(0f)
+                    plugin.logger.info("[BeltDBG]   item[$itemId] GAP_CROSS beltPos=${"%.3f".format(item.beltPos)} gapLimit=${"%.3f".format(gapLimit)} destBlocked=$destBlocked advanceGap=${"%.4f".format(advanceGap)}")
+                    if (!destBlocked && advanceGap > 0f) {
+                        item.beltPos = if (forward) item.beltPos + advanceGap else item.beltPos - advanceGap
+                        updateBeltItemDisplay(item, posA, stepX, stepZ)
+                    }
+
+                } else {
+                    val endBlock = world.getBlockAt(endPos.bx + exitX, endPos.by, endPos.bz + exitZ)
+                    plugin.logger.info("[BeltDBG]   item[$itemId] END solid=${endBlock.type.isSolid} block=${endBlock.type}")
+                    if (!endBlock.type.isSolid) {
+                        (item.cachedDisplay?.takeIf { it.isValid }
+                            ?: plugin.server.getEntity(item.displayUuid) as? ItemDisplay)?.remove()
+                        world.dropItemNaturally(
+                            Location(world, endPos.bx + exitX + 0.5, endPos.by + 0.875, endPos.bz + exitZ + 0.5),
+                            item.item.clone()
+                        )
+                        plugin.logger.info("[BeltDBG]   item[$itemId] DROPPED at (${endPos.bx+exitX},${endPos.by},${endPos.bz+exitZ})")
+                        toRemove.add(item)
+                    }
                 }
                 continue
             }
 
-            // i-1 is frontmost (sorted above), so it is the "item ahead"
+            // ── Normal movement along the belt ───────────────────────────────
             val frontItem = if (i > 0 && belt.items[i - 1] !in toRemove) belt.items[i - 1] else null
 
             val advance = if (frontItem != null) {
                 val gap = if (forward) frontItem.beltPos - item.beltPos
                           else        item.beltPos - frontItem.beltPos
-                if (gap <= BELT_ITEM_SPACING) 0f else minOf(speed, gap - BELT_ITEM_SPACING)
+                val adv = if (gap <= BELT_ITEM_SPACING) 0f else minOf(speed, gap - BELT_ITEM_SPACING)
+                if (adv == 0f) plugin.logger.info("[BeltDBG]   item[$itemId] BLOCKED_BY_FRONT gap=${"%.3f".format(gap)} spacing=$BELT_ITEM_SPACING front=${frontItem.displayUuid.toString().takeLast(6)}")
+                adv
             } else {
                 val wouldPassEnd = if (forward) item.beltPos + speed >= endBeltP
                                    else         item.beltPos - speed <= endBeltP
                 if (wouldPassEnd) {
-                    val hasNextBelt = listOf(
-                        AxlePos(posA.worldName, endPos.bx + exitX, endPos.by, endPos.bz + exitZ),
-                        AxlePos(posA.worldName, endPos.bx - exitZ, endPos.by, endPos.bz + exitX),
-                        AxlePos(posA.worldName, endPos.bx + exitZ, endPos.by, endPos.bz - exitX),
-                    ).any { c -> beltsByAxle[c]?.let { it !== belt } == true }
+                    val hasNextBelt = exitCandidates.any { c -> beltsByAxle[c]?.let { it !== belt } == true }
                     if (hasNextBelt) speed
                     else {
                         val endBlock = world.getBlockAt(endPos.bx + exitX, endPos.by, endPos.bz + exitZ)
                         if (endBlock.type.isSolid) {
                             val remaining = if (forward) endBeltP - item.beltPos else item.beltPos - endBeltP
+                            if (remaining <= 0f) plugin.logger.info("[BeltDBG]   item[$itemId] AT_WALL beltPos=${"%.3f".format(item.beltPos)}")
                             remaining.coerceAtLeast(0f)
                         } else speed
                     }
                 } else speed
             }
+
+            plugin.logger.info("[BeltDBG]   item[$itemId] MOVE beltPos=${"%.3f".format(item.beltPos)} advance=${"%.4f".format(advance)} frontItem=${frontItem != null}")
 
             if (advance > 0f) {
                 val newPos = if (forward) item.beltPos + advance else item.beltPos - advance
@@ -628,15 +658,25 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
     }
 
     private fun pickupItemEntities(world: World, belt: BeltEntry, posA: AxlePos, stepX: Int, stepZ: Int) {
+        val beltTag = "belt[${posA.bx},${posA.by},${posA.bz}]"
         for ((index, pos) in belt.allPositions.withIndex()) {
             val slotPos = index.toFloat()
-            if (belt.items.any { kotlin.math.abs(it.beltPos - slotPos) < 0.5f }) continue
-            val nearby = world.getNearbyEntities(
+            val occupied = belt.items.any { kotlin.math.abs(it.beltPos - slotPos) < 0.5f }
+            val allNearby = world.getNearbyEntities(
                 Location(world, pos.bx + 0.5, pos.by + 1.25, pos.bz + 0.5), 0.45, 0.45, 0.45
             ).filterIsInstance<org.bukkit.entity.Item>()
-            if (nearby.isEmpty()) continue
-            belt.items.add(spawnBeltItem(world, posA, stepX, stepZ, nearby.first().itemStack.clone(), slotPos))
-            nearby.first().remove()
+            val nearby = allNearby.filter { !it.itemStack.type.isAir }
+            if (allNearby.isNotEmpty())
+                plugin.logger.info("[BeltDBG] $beltTag pickup scan slot=$index slotPos=$slotPos occupied=$occupied allFound=${allNearby.size} nonAir=${nearby.size}")
+            if (occupied || nearby.isEmpty()) continue
+            val itemEntity = nearby.first()
+            plugin.logger.info("[BeltDBG] $beltTag PICKUP entity=${itemEntity.uniqueId.toString().takeLast(6)} stack=${itemEntity.itemStack.type} pos=(${itemEntity.location.x.toInt()},${itemEntity.location.y.toInt()},${itemEntity.location.z.toInt()})")
+            val itemStack  = itemEntity.itemStack.clone()
+            itemEntity.itemStack = org.bukkit.inventory.ItemStack(Material.AIR)
+            itemEntity.remove()
+            val spawned = spawnBeltItem(world, posA, stepX, stepZ, itemStack, slotPos)
+            plugin.logger.info("[BeltDBG] $beltTag spawned BeltItem=${spawned.displayUuid.toString().takeLast(6)} beltPos=$slotPos")
+            belt.items.add(spawned)
         }
     }
 
@@ -702,9 +742,8 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         // beltPos is reconstructed from the transformation translation (persisted in entity NBT).
         val posATag = "${posA.worldName},${posA.bx},${posA.by},${posA.bz}"
         display.persistentDataContainer.set(pdcBeltItemPosA,  PersistentDataType.STRING, posATag)
-        display.persistentDataContainer.set(pdcBeltItemStack, PersistentDataType.STRING,
-            "${item.type.name}:${item.amount}")
-        return BeltItem(display.uniqueId, item.clone(), beltPos).also { it.cachedDisplay = display }
+        display.persistentDataContainer.set(pdcBeltItemStack, PersistentDataType.BYTE_ARRAY, item.serializeAsBytes())
+        return BeltItem(display.uniqueId, item.clone(), beltPos, posA.bx, posA.bz).also { it.cachedDisplay = display }
     }
 
     private fun updateBeltItemDisplay(item: BeltItem, posA: AxlePos, stepX: Int, stepZ: Int) {
@@ -713,8 +752,14 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
             ?: return
         display.interpolationDuration = 2
         display.interpolationDelay   = 0
+        // Translation = (offset from original anchor to current belt's posA) + (beltPos in belt direction).
+        // The entity is never teleported after spawn, so this accumulates cleanly across belt transfers.
         display.transformation = Transformation(
-            Vector3f(item.beltPos * stepX, BELT_ITEM_Y_OFFSET, item.beltPos * stepZ),
+            Vector3f(
+                (posA.bx - item.bxAnchor) + item.beltPos * stepX,
+                BELT_ITEM_Y_OFFSET,
+                (posA.bz - item.bzAnchor) + item.beltPos * stepZ
+            ),
             beltItemRotation(stepX, stepZ),
             Vector3f(BELT_ITEM_SCALE, BELT_ITEM_SCALE, BELT_ITEM_SCALE), IDENTITY_Q
         )
@@ -1273,16 +1318,13 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
                     continue
                 }
 
-                // Belt item display — has belt_item_posa + belt_item_stack
-                val itemPosATag = pdc.get(pdcBeltItemPosA, PersistentDataType.STRING) ?: continue
-                val stackStr    = pdc.get(pdcBeltItemStack, PersistentDataType.STRING) ?: continue
+                // Belt item display — has belt_item_posa + belt_item_stack2
+                val itemPosATag = pdc.get(pdcBeltItemPosA,  PersistentDataType.STRING)     ?: continue
+                val stackBytes  = pdc.get(pdcBeltItemStack, PersistentDataType.BYTE_ARRAY) ?: continue
                 val posA        = parseAxlePos(itemPosATag) ?: continue
-                val stackParts  = stackStr.split(":")
-                if (stackParts.size < 2) continue
-                val mat    = runCatching { Material.valueOf(stackParts[0]) }.getOrNull() ?: continue
-                val amount = stackParts[1].toIntOrNull() ?: 1
+                val item = runCatching { org.bukkit.inventory.ItemStack.deserializeBytes(stackBytes) }.getOrNull() ?: continue
                 itemsByPosA.getOrPut(posA) { mutableListOf() }
-                    .add(ItemInfo(entity, org.bukkit.inventory.ItemStack(mat, amount)))
+                    .add(ItemInfo(entity, item))
             }
         }
 
@@ -1309,19 +1351,41 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         }
 
         // Re-attach belt items to restored belts.
-        // beltPos is derived from the entity's own transformation translation (persisted in NBT).
+        // Build a set of display UUIDs already tracked in memory so chunk-reload events
+        // never inject a duplicate BeltItem for an entity that is already in transit.
+        val alreadyTracked = beltsByAxle.values.toSet().flatMapTo(mutableSetOf()) { b -> b.items.map { it.displayUuid } }
+
         for ((posA, infos) in itemsByPosA) {
             val belt = beltsByAxle[posA] ?: continue
+            val world = plugin.server.getWorld(posA.worldName) ?: continue
             val beltPosB = belt.allPositions.last()
             val stepX = when { beltPosB.bx > posA.bx -> 1; beltPosB.bx < posA.bx -> -1; else -> 0 }
             val stepZ = when { beltPosB.bz > posA.bz -> 1; beltPosB.bz < posA.bz -> -1; else -> 0 }
+            val dist  = (belt.allPositions.size - 1).toFloat()
             for ((disp, item) in infos) {
+                if (disp.uniqueId in alreadyTracked) {
+                    plugin.logger.info("[Belt] Skipping restore of item ${disp.uniqueId.toString().takeLast(6)} — already tracked in belt")
+                    continue
+                }
                 val t = disp.transformation.translation
-                // beltPos = dot(translation, step) since only one axis is nonzero
-                val beltPos = (t.x * stepX + t.z * stepZ).coerceIn(0f, (belt.allPositions.size - 1).toFloat())
-                val beltItem = BeltItem(disp.uniqueId, item, beltPos)
+                val bxAnchor = (disp.x - 0.5).toInt()
+                val bzAnchor = (disp.z - 0.5).toInt()
+                val offsetX = posA.bx - bxAnchor
+                val offsetZ = posA.bz - bzAnchor
+                val beltPos = ((t.x - offsetX) * stepX + (t.z - offsetZ) * stepZ).coerceIn(0f, dist)
+                disp.teleportDuration = 0
+                disp.teleport(Location(world, posA.bx + 0.5, posA.by + 0.5, posA.bz + 0.5))
+                disp.interpolationDuration = 0
+                disp.interpolationDelay    = 0
+                disp.transformation = Transformation(
+                    Vector3f(beltPos * stepX, BELT_ITEM_Y_OFFSET, beltPos * stepZ),
+                    beltItemRotation(stepX, stepZ),
+                    Vector3f(BELT_ITEM_SCALE, BELT_ITEM_SCALE, BELT_ITEM_SCALE), IDENTITY_Q
+                )
+                val beltItem = BeltItem(disp.uniqueId, item, beltPos, posA.bx, posA.bz)
                 beltItem.cachedDisplay = disp
                 belt.items.add(beltItem)
+                alreadyTracked.add(disp.uniqueId)
             }
         }
 
@@ -1383,15 +1447,37 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
     /** Scans a newly loaded chunk (called by ChunkLoadEvent). */
     fun restoreFromChunk(chunk: org.bukkit.Chunk) {
         var count = 0
-        for (entity in chunk.entities)
-            if (entity is ItemDisplay &&
-                entity.persistentDataContainer.has(pdcGearType, PersistentDataType.STRING) &&
-                restoreDisplay(entity)) count++
+        var needsBeltRestore = false
+        for (entity in chunk.entities) {
+            if (entity !is ItemDisplay) continue
+            val pdc = entity.persistentDataContainer
+            if (pdc.has(pdcGearType, PersistentDataType.STRING) && restoreDisplay(entity)) count++
+
+            if (!needsBeltRestore) {
+                val posA: AxlePos? = when {
+                    pdc.has(pdcBeltEndB, PersistentDataType.STRING) -> {
+                        val bx = pdc.get(pdcBX, PersistentDataType.INTEGER)
+                        val by = pdc.get(pdcBY, PersistentDataType.INTEGER)
+                        val bz = pdc.get(pdcBZ, PersistentDataType.INTEGER)
+                        val wn = pdc.get(pdcWorldName, PersistentDataType.STRING)
+                        if (bx != null && by != null && bz != null && wn != null) AxlePos(wn, bx, by, bz) else null
+                    }
+                    else -> {
+                        val tag = pdc.get(pdcBeltFixedPosA, PersistentDataType.STRING)
+                            ?: pdc.get(pdcBeltItemPosA, PersistentDataType.STRING)
+                        tag?.let { parseAxlePos(it) }
+                    }
+                }
+                if (posA != null && !beltsByAxle.containsKey(posA)) needsBeltRestore = true
+            }
+        }
         if (count > 0) plugin.logger.info("Restored $count gear(s) from chunk (${chunk.x}, ${chunk.z}).")
 
-        // Debounce belt restoration: reset the 20-tick countdown each time a chunk loads.
-        // This ensures all adjacent chunks (and their gear entities) are in memory before
-        // we try to re-attach belts. Without this, restoreBeltsFromWorld runs too early.
+        if (!needsBeltRestore) return
+
+        // Debounce belt restoration: reset the 20-tick countdown each time a chunk with
+        // untracked belt data loads. This ensures adjacent chunks are in memory before
+        // we try to re-attach belts. Skipped entirely when all belts are already tracked.
         if (pendingBeltRestoreTaskId != -1)
             plugin.server.scheduler.cancelTask(pendingBeltRestoreTaskId)
         pendingBeltRestoreTaskId = plugin.server.scheduler.runTaskLater(plugin, Runnable {
@@ -1481,7 +1567,9 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         val dead = mutableListOf<AxlePos>()
         for ((_, entry) in gearsByPos) {
             val display = entry.cachedDisplay
-            if (display == null || !display.isValid) dead.add(entry.pos)
+            // isDead() = entity actually removed; !isValid() would also fire on chunk unload,
+            // causing a restore loop when the chunk reloads.
+            if (display == null || display.isDead()) dead.add(entry.pos)
         }
         dead.forEach { pos ->
             detachBelt(pos, clearPersistence = false)  // clean up in-memory state; keep PDC so belt can be restored on reload
