@@ -51,8 +51,11 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
     val networks = mutableMapOf<Int, GearNetwork>()
     val millstoneData = mutableMapOf<AxlePos, MillstoneData>()
     private val beltsByAxle = mutableMapOf<AxlePos, BeltEntry>()
+    /** Reverse lookup: every belt block pos → (belt, slotIndex). O(1) for BlockPlace/Break events. */
+    internal val beltBlockPos = mutableMapOf<AxlePos, Pair<BeltEntry, Int>>()
     private var nextNetworkId = 0
     private var tickCount = 0
+    private val beltDebug = false
     // Belt restoration is debounced: fires 20 ticks after the last chunk load so all
     // adjacent chunks (and their gear entities) are ready before we try to re-attach.
     private var pendingBeltRestoreTaskId = -1
@@ -389,11 +392,13 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
                 ?.persistentDataContainer?.set(pdcBeltFixedPosA, PersistentDataType.STRING, posATag)
         }
 
+        scanBeltInteractors(world, belt)
         return true
     }
 
     fun detachBelt(pos: AxlePos, clearPersistence: Boolean = true) {
         val belt = beltsByAxle[pos] ?: return
+        clearBeltInteractors(belt)
         val worldName = belt.allPositions.firstOrNull()?.worldName ?: return
         val world = plugin.server.getWorld(worldName) ?: return
 
@@ -437,6 +442,66 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         }
 
         if (belt.mergedNetworkId != -1) rebuildNetworks(belt.mergedNetworkId)
+    }
+
+    // ─── Belt interaction points ──────────────────────────────────────────────
+
+    /**
+     * Scans every slot of [belt] for adjacent hoppers (and future interactors),
+     * populates [belt].interactors, and registers all belt block positions in [beltBlockPos].
+     */
+    internal fun scanBeltInteractors(world: World, belt: BeltEntry) {
+        belt.allPositions.forEach { beltBlockPos.remove(it) }
+        belt.interactors.clear()
+        for ((index, pos) in belt.allPositions.withIndex()) {
+            beltBlockPos[pos] = belt to index
+            updateInteractorAt(world, belt, index)
+        }
+    }
+
+    private fun clearBeltInteractors(belt: BeltEntry) {
+        belt.allPositions.forEach { beltBlockPos.remove(it) }
+        belt.interactors.clear()
+    }
+
+    /**
+     * Re-scans a single slot and updates [belt].interactors for that slot only.
+     * Called by [BeltBlockListener] when a block is placed or broken adjacent to the belt.
+     */
+    internal fun updateInteractorAt(world: World, belt: BeltEntry, slotIndex: Int) {
+        val pos = belt.allPositions.getOrNull(slotIndex) ?: return
+        val list = mutableListOf<BeltInteractor>()
+
+        // HopperExtract: vanilla hopper directly below this slot (any facing)
+        val below = world.getBlockAt(pos.bx, pos.by - 1, pos.bz)
+        if (below.type == Material.HOPPER)
+            list += BeltInteractor.HopperExtract(AxlePos(world.name, pos.bx, pos.by - 1, pos.bz))
+
+        // HopperInsert: hopper directly above facing down
+        val above = world.getBlockAt(pos.bx, pos.by + 1, pos.bz)
+        if (above.type == Material.HOPPER) {
+            val data = above.blockData as? org.bukkit.block.data.type.Hopper
+            if (data?.facing == org.bukkit.block.BlockFace.DOWN)
+                list += BeltInteractor.HopperInsert(AxlePos(world.name, pos.bx, pos.by + 1, pos.bz))
+        }
+
+        // HopperInsert: hoppers from four horizontal sides pointing at this slot
+        for ((dx, dz, face) in listOf(
+            Triple( 1,  0, org.bukkit.block.BlockFace.WEST),
+            Triple(-1,  0, org.bukkit.block.BlockFace.EAST),
+            Triple( 0,  1, org.bukkit.block.BlockFace.NORTH),
+            Triple( 0, -1, org.bukkit.block.BlockFace.SOUTH)
+        )) {
+            val side = world.getBlockAt(pos.bx + dx, pos.by, pos.bz + dz)
+            if (side.type == Material.HOPPER) {
+                val data = side.blockData as? org.bukkit.block.data.type.Hopper
+                if (data?.facing == face)
+                    list += BeltInteractor.HopperInsert(AxlePos(world.name, pos.bx + dx, pos.by, pos.bz + dz))
+            }
+        }
+
+        if (list.isEmpty()) belt.interactors.remove(slotIndex)
+        else belt.interactors[slotIndex] = list
     }
 
     fun addAxleToBelt(world: World, pos: AxlePos): Boolean {
@@ -493,7 +558,7 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         val stepZ = when { posB.bz > posA.bz -> 1; posB.bz < posA.bz -> -1; else -> 0 }
 
         if (tickCount % 4 == 0) pickupItemEntities(world, belt, posA, stepX, stepZ)
-        if (tickCount % 8 == 0) tickBeltHoppers(world, belt, posA, stepX, stepZ)
+        if (tickCount % 8 == 0) tickBeltInteractorsInsert(world, belt, posA, stepX, stepZ)
 
         val refEntry = gearsByPos[belt.axlePositions.firstOrNull() ?: return] ?: return
         val baseDpt  = networks[refEntry.networkId]?.lastBaseDpt ?: 0f
@@ -514,7 +579,7 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
 
         val speed   = kotlin.math.abs(signedSpeed)
         val forward = signedSpeed > 0f   // true = A→B, false = B→A
-        if (belt.items.isNotEmpty())
+        if (beltDebug && belt.items.isNotEmpty())
             plugin.logger.info("[BeltDBG] $beltTag tick=$tickCount items=${belt.items.size} speed=${"%.4f".format(speed)} forward=$forward")
 
         // "Exit" end and direction for end-of-belt and belt-chain checks
@@ -543,7 +608,7 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
             // ── Phase 1: item has reached or passed the belt end ─────────────
             val pastEnd = if (forward) item.beltPos >= endBeltP else item.beltPos <= endBeltP
             if (pastEnd) {
-                plugin.logger.info("[BeltDBG]   item[$itemId] PAST_END beltPos=${"%.3f".format(item.beltPos)} endBeltP=$endBeltP")
+                if (beltDebug) plugin.logger.info("[BeltDBG]   item[$itemId] PAST_END beltPos=${"%.3f".format(item.beltPos)} endBeltP=$endBeltP")
 
                 // Find the first connected belt (straight, left, or right turn).
                 var nextBelt: BeltEntry? = null
@@ -554,7 +619,7 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
                     val idx = nb.allPositions.indexOf(candidate)
                     if (idx >= 0) { nextBelt = nb; nextEntryIdx = idx; break }
                 }
-                plugin.logger.info("[BeltDBG]   item[$itemId] nextBelt=${nextBelt != null} candidates=$exitCandidates")
+                if (beltDebug) plugin.logger.info("[BeltDBG]   item[$itemId] nextBelt=${nextBelt != null} candidates=$exitCandidates")
 
                 // ── Phase 2: item has crossed the 1-block gap → instant swap ─
                 val gapLimit = if (forward) endBeltP + 1f else endBeltP - 1f
@@ -565,7 +630,7 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
                     val overshoot = if (forward) item.beltPos - gapLimit else gapLimit - item.beltPos
                     val newBeltPos = entryPos + overshoot
                     val blocked = nextBelt.items.any { kotlin.math.abs(it.beltPos - entryPos) < BELT_ITEM_SPACING }
-                    plugin.logger.info("[BeltDBG]   item[$itemId] TRANSFER→nextBelt newBeltPos=${"%.3f".format(newBeltPos)} blocked=$blocked")
+                    if (beltDebug) plugin.logger.info("[BeltDBG]   item[$itemId] TRANSFER→nextBelt newBeltPos=${"%.3f".format(newBeltPos)} blocked=$blocked")
                     if (!blocked) {
                         val nA  = nextBelt.allPositions.first()
                         val nB2 = nextBelt.allPositions.last()
@@ -582,12 +647,12 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
                             nextBelt.items.add(item)
                             updateBeltItemDisplay(item, nA, nSX, nSZ)
                         } else {
-                            plugin.logger.warning("[BeltDBG]   item[$itemId] display entity MISSING at transfer, respawning")
+                            if (beltDebug) plugin.logger.warning("[BeltDBG]   item[$itemId] display entity MISSING at transfer, respawning")
                             toRemove.add(item)
                             nextBelt.items.add(spawnBeltItem(world, nA, nSX, nSZ, item.item.clone(), newBeltPos))
                         }
                     } else {
-                        plugin.logger.info("[BeltDBG]   item[$itemId] HOLD at gapLimit=${"%.3f".format(gapLimit)} (dest blocked)")
+                        if (beltDebug) plugin.logger.info("[BeltDBG]   item[$itemId] HOLD at gapLimit=${"%.3f".format(gapLimit)} (dest blocked)")
                         item.beltPos = gapLimit
                     }
 
@@ -596,15 +661,19 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
                     val destBlocked = nextBelt.items.any { kotlin.math.abs(it.beltPos - entryPos) < BELT_ITEM_SPACING }
                     val advanceGap = if (forward) minOf(speed, gapLimit - item.beltPos).coerceAtLeast(0f)
                                      else        minOf(speed, item.beltPos - gapLimit).coerceAtLeast(0f)
-                    plugin.logger.info("[BeltDBG]   item[$itemId] GAP_CROSS beltPos=${"%.3f".format(item.beltPos)} gapLimit=${"%.3f".format(gapLimit)} destBlocked=$destBlocked advanceGap=${"%.4f".format(advanceGap)}")
+                    if (beltDebug) plugin.logger.info("[BeltDBG]   item[$itemId] GAP_CROSS beltPos=${"%.3f".format(item.beltPos)} gapLimit=${"%.3f".format(gapLimit)} destBlocked=$destBlocked advanceGap=${"%.4f".format(advanceGap)}")
                     if (!destBlocked && advanceGap > 0f) {
                         item.beltPos = if (forward) item.beltPos + advanceGap else item.beltPos - advanceGap
                         updateBeltItemDisplay(item, posA, stepX, stepZ)
                     }
 
                 } else {
+                    // Hopper at the last slot has priority over dropping
+                    val lastSlot = endBeltP.toInt().coerceIn(0, belt.allPositions.size - 1)
+                    if (tryExtractBeltItem(world, belt, item, lastSlot, toRemove)) continue
+
                     val endBlock = world.getBlockAt(endPos.bx + exitX, endPos.by, endPos.bz + exitZ)
-                    plugin.logger.info("[BeltDBG]   item[$itemId] END solid=${endBlock.type.isSolid} block=${endBlock.type}")
+                    if (beltDebug) plugin.logger.info("[BeltDBG]   item[$itemId] END solid=${endBlock.type.isSolid} block=${endBlock.type}")
                     if (!endBlock.type.isSolid) {
                         (item.cachedDisplay?.takeIf { it.isValid }
                             ?: plugin.server.getEntity(item.displayUuid) as? ItemDisplay)?.remove()
@@ -612,12 +681,16 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
                             Location(world, endPos.bx + exitX + 0.5, endPos.by + 0.875, endPos.bz + exitZ + 0.5),
                             item.item.clone()
                         )
-                        plugin.logger.info("[BeltDBG]   item[$itemId] DROPPED at (${endPos.bx+exitX},${endPos.by},${endPos.bz+exitZ})")
+                        if (beltDebug) plugin.logger.info("[BeltDBG]   item[$itemId] DROPPED at (${endPos.bx+exitX},${endPos.by},${endPos.bz+exitZ})")
                         toRemove.add(item)
                     }
                 }
                 continue
             }
+
+            // ── Extract interactors: hopper below this slot pulls item out ────
+            val currentSlot = item.beltPos.toInt().coerceIn(0, belt.allPositions.size - 1)
+            if (tryExtractBeltItem(world, belt, item, currentSlot, toRemove)) continue
 
             // ── Normal movement along the belt ───────────────────────────────
             val frontItem = if (i > 0 && belt.items[i - 1] !in toRemove) belt.items[i - 1] else null
@@ -626,7 +699,7 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
                 val gap = if (forward) frontItem.beltPos - item.beltPos
                           else        item.beltPos - frontItem.beltPos
                 val adv = if (gap <= BELT_ITEM_SPACING) 0f else minOf(speed, gap - BELT_ITEM_SPACING)
-                if (adv == 0f) plugin.logger.info("[BeltDBG]   item[$itemId] BLOCKED_BY_FRONT gap=${"%.3f".format(gap)} spacing=$BELT_ITEM_SPACING front=${frontItem.displayUuid.toString().takeLast(6)}")
+                if (adv == 0f && beltDebug) plugin.logger.info("[BeltDBG]   item[$itemId] BLOCKED_BY_FRONT gap=${"%.3f".format(gap)} spacing=$BELT_ITEM_SPACING front=${frontItem.displayUuid.toString().takeLast(6)}")
                 adv
             } else {
                 val wouldPassEnd = if (forward) item.beltPos + speed >= endBeltP
@@ -638,14 +711,14 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
                         val endBlock = world.getBlockAt(endPos.bx + exitX, endPos.by, endPos.bz + exitZ)
                         if (endBlock.type.isSolid) {
                             val remaining = if (forward) endBeltP - item.beltPos else item.beltPos - endBeltP
-                            if (remaining <= 0f) plugin.logger.info("[BeltDBG]   item[$itemId] AT_WALL beltPos=${"%.3f".format(item.beltPos)}")
+                            if (remaining <= 0f && beltDebug) plugin.logger.info("[BeltDBG]   item[$itemId] AT_WALL beltPos=${"%.3f".format(item.beltPos)}")
                             remaining.coerceAtLeast(0f)
                         } else speed
                     }
                 } else speed
             }
 
-            plugin.logger.info("[BeltDBG]   item[$itemId] MOVE beltPos=${"%.3f".format(item.beltPos)} advance=${"%.4f".format(advance)} frontItem=${frontItem != null}")
+            if (beltDebug) plugin.logger.info("[BeltDBG]   item[$itemId] MOVE beltPos=${"%.3f".format(item.beltPos)} advance=${"%.4f".format(advance)} frontItem=${frontItem != null}")
 
             if (advance > 0f) {
                 val newPos = if (forward) item.beltPos + advance else item.beltPos - advance
@@ -666,58 +739,62 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
                 Location(world, pos.bx + 0.5, pos.by + 1.25, pos.bz + 0.5), 0.45, 0.45, 0.45
             ).filterIsInstance<org.bukkit.entity.Item>()
             val nearby = allNearby.filter { !it.itemStack.type.isAir }
-            if (allNearby.isNotEmpty())
+            if (beltDebug && allNearby.isNotEmpty())
                 plugin.logger.info("[BeltDBG] $beltTag pickup scan slot=$index slotPos=$slotPos occupied=$occupied allFound=${allNearby.size} nonAir=${nearby.size}")
             if (occupied || nearby.isEmpty()) continue
             val itemEntity = nearby.first()
-            plugin.logger.info("[BeltDBG] $beltTag PICKUP entity=${itemEntity.uniqueId.toString().takeLast(6)} stack=${itemEntity.itemStack.type} pos=(${itemEntity.location.x.toInt()},${itemEntity.location.y.toInt()},${itemEntity.location.z.toInt()})")
+            if (beltDebug) plugin.logger.info("[BeltDBG] $beltTag PICKUP entity=${itemEntity.uniqueId.toString().takeLast(6)} stack=${itemEntity.itemStack.type} pos=(${itemEntity.location.x.toInt()},${itemEntity.location.y.toInt()},${itemEntity.location.z.toInt()})")
             val itemStack  = itemEntity.itemStack.clone()
             itemEntity.itemStack = org.bukkit.inventory.ItemStack(Material.AIR)
             itemEntity.remove()
             val spawned = spawnBeltItem(world, posA, stepX, stepZ, itemStack, slotPos)
-            plugin.logger.info("[BeltDBG] $beltTag spawned BeltItem=${spawned.displayUuid.toString().takeLast(6)} beltPos=$slotPos")
+            if (beltDebug) plugin.logger.info("[BeltDBG] $beltTag spawned BeltItem=${spawned.displayUuid.toString().takeLast(6)} beltPos=$slotPos")
             belt.items.add(spawned)
         }
     }
 
-    private fun tickBeltHoppers(world: World, belt: BeltEntry, posA: AxlePos, stepX: Int, stepZ: Int) {
-        for ((index, pos) in belt.allPositions.withIndex()) {
-            val slotPos = index.toFloat()
+    private fun tickBeltInteractorsInsert(world: World, belt: BeltEntry, posA: AxlePos, stepX: Int, stepZ: Int) {
+        for ((slotIndex, interactors) in belt.interactors) {
+            val slotPos = slotIndex.toFloat()
             if (belt.items.any { kotlin.math.abs(it.beltPos - slotPos) < 0.5f }) continue
-
-            // Hopper above facing DOWN
-            if (tryHopperInsert(world.getBlockAt(pos.bx, pos.by + 1, pos.bz),
-                    org.bukkit.block.BlockFace.DOWN, world, belt, posA, stepX, stepZ, slotPos)) continue
-
-            // Hoppers from four sides
-            for ((dx, dz, face) in listOf(
-                Triple( 1,  0, org.bukkit.block.BlockFace.WEST),
-                Triple(-1,  0, org.bukkit.block.BlockFace.EAST),
-                Triple( 0,  1, org.bukkit.block.BlockFace.NORTH),
-                Triple( 0, -1, org.bukkit.block.BlockFace.SOUTH)
-            )) {
-                if (tryHopperInsert(world.getBlockAt(pos.bx + dx, pos.by, pos.bz + dz),
-                        face, world, belt, posA, stepX, stepZ, slotPos)) break
+            for (interactor in interactors) {
+                if (interactor !is BeltInteractor.HopperInsert) continue
+                val hPos = interactor.hopperPos
+                val block = world.getBlockAt(hPos.bx, hPos.by, hPos.bz)
+                if (block.type != Material.HOPPER) continue
+                val inv = (block.state as? org.bukkit.block.Hopper)?.inventory ?: continue
+                for (i in 0 until inv.size) {
+                    val stack = inv.getItem(i) ?: continue
+                    if (stack.type.isAir) continue
+                    val transfer = stack.clone().also { it.amount = 1 }
+                    stack.amount -= 1
+                    inv.setItem(i, if (stack.amount <= 0) null else stack)
+                    belt.items.add(spawnBeltItem(world, posA, stepX, stepZ, transfer, slotPos))
+                    break
+                }
+                break  // one inserter per slot per 8 ticks
             }
         }
     }
 
-    private fun tryHopperInsert(
-        block: org.bukkit.block.Block, requiredFacing: org.bukkit.block.BlockFace,
-        world: World, belt: BeltEntry, posA: AxlePos, stepX: Int, stepZ: Int, slotPos: Float
+    private fun tryExtractBeltItem(
+        world: World, belt: BeltEntry, item: BeltItem,
+        slotIndex: Int, toRemove: MutableList<BeltItem>
     ): Boolean {
-        if (block.type != Material.HOPPER) return false
-        val data = block.blockData as? org.bukkit.block.data.type.Hopper ?: return false
-        if (data.facing != requiredFacing) return false
-        val inv = (block.state as? org.bukkit.block.Hopper)?.inventory ?: return false
-        for (i in 0 until inv.size) {
-            val stack = inv.getItem(i) ?: continue
-            if (stack.type.isAir) continue
-            val transfer = stack.clone().also { it.amount = 1 }
-            stack.amount -= 1
-            inv.setItem(i, if (stack.amount <= 0) null else stack)
-            belt.items.add(spawnBeltItem(world, posA, stepX, stepZ, transfer, slotPos))
-            return true
+        val interactors = belt.interactors[slotIndex] ?: return false
+        for (interactor in interactors) {
+            if (interactor !is BeltInteractor.HopperExtract) continue
+            val hPos = interactor.hopperPos
+            val block = world.getBlockAt(hPos.bx, hPos.by, hPos.bz)
+            if (block.type != Material.HOPPER) continue
+            val inv = (block.state as? org.bukkit.block.Hopper)?.inventory ?: continue
+            val overflow = inv.addItem(item.item.clone())
+            if (overflow.isEmpty()) {
+                (item.cachedDisplay?.takeIf { it.isValid }
+                    ?: plugin.server.getEntity(item.displayUuid) as? ItemDisplay)?.remove()
+                toRemove.add(item)
+                return true
+            }
         }
         return false
     }
@@ -1435,6 +1512,7 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
 
         val belt = BeltEntry(allPositions, axlePositions, fixedUuids.toMutableList(), primaryNet?.id ?: -1)
         for (pos in allPositions) beltsByAxle[pos] = belt
+        plugin.server.getWorld(posA.worldName)?.let { scanBeltInteractors(it, belt) }
         return true
     }
 

@@ -10,4 +10,7 @@ class BeltEntry(
     val mergedNetworkId: Int                // network ID after merging all axle networks
 ) {
     val items: MutableList<BeltItem> = mutableListOf()
+
+    /** slotIndex → interactors registered at that slot (hoppers, future extractors/inserters). */
+    val interactors: MutableMap<Int, MutableList<BeltInteractor>> = mutableMapOf()
 }
