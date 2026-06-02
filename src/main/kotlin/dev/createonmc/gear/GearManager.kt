@@ -477,12 +477,18 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         if (below.type == Material.HOPPER)
             list += BeltInteractor.HopperExtract(AxlePos(world.name, pos.bx, pos.by - 1, pos.bz))
 
-        // HopperInsert: hopper directly above facing down
+        // Block directly above: hopper facing down = inserter; any other solid block = obstacle
         val above = world.getBlockAt(pos.bx, pos.by + 1, pos.bz)
-        if (above.type == Material.HOPPER) {
-            val data = above.blockData as? org.bukkit.block.data.type.Hopper
-            if (data?.facing == org.bukkit.block.BlockFace.DOWN)
-                list += BeltInteractor.HopperInsert(AxlePos(world.name, pos.bx, pos.by + 1, pos.bz))
+        when {
+            above.type == Material.HOPPER -> {
+                val data = above.blockData as? org.bukkit.block.data.type.Hopper
+                if (data?.facing == org.bukkit.block.BlockFace.DOWN)
+                    list += BeltInteractor.HopperInsert(AxlePos(world.name, pos.bx, pos.by + 1, pos.bz))
+                else
+                    list += BeltInteractor.Obstacle  // hopper above but not inserting → physically blocks
+            }
+            !above.type.isAir && above.type != Material.BARRIER ->
+                list += BeltInteractor.Obstacle
         }
 
         // HopperInsert: hoppers from four horizontal sides pointing at this slot
@@ -720,7 +726,14 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
 
             if (beltDebug) plugin.logger.info("[BeltDBG]   item[$itemId] MOVE beltPos=${"%.3f".format(item.beltPos)} advance=${"%.4f".format(advance)} frontItem=${frontItem != null}")
 
-            if (advance > 0f) {
+            val blockedByObstacle = advance > 0f && run {
+                val targetSlot = if (forward) (item.beltPos + advance).toInt()
+                                 else         (item.beltPos - advance).toInt()
+                targetSlot != item.beltPos.toInt() &&
+                    belt.interactors[targetSlot]?.any { it is BeltInteractor.Obstacle } == true
+            }
+
+            if (advance > 0f && !blockedByObstacle) {
                 val newPos = if (forward) item.beltPos + advance else item.beltPos - advance
                 item.beltPos = if (forward) newPos.coerceAtMost(endBeltP) else newPos.coerceAtLeast(endBeltP)
                 updateBeltItemDisplay(item, posA, stepX, stepZ)

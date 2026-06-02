@@ -18,4 +18,7 @@ sealed class BeltInteractor {
 
     /** A hopper (or future extractor) below the belt that pulls items OUT. */
     data class HopperExtract(val hopperPos: AxlePos) : BeltInteractor()
+
+    /** A solid non-barrier block directly above this slot that prevents items from passing through. */
+    object Obstacle : BeltInteractor()
 }
