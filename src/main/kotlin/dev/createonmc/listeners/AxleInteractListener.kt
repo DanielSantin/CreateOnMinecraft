@@ -238,7 +238,7 @@ class AxleInteractListener(
         gearManager.saveMillstoneState(pos)
     }
 
-    // Hit a barrier block to remove whatever is there (preview or gear)
+    // Hit a barrier block to remove whatever is there (preview, funel, belt, or gear)
     @EventHandler
     fun onHitBarrier(event: PlayerInteractEvent) {
         if (event.action != Action.LEFT_CLICK_BLOCK) return
@@ -248,10 +248,18 @@ class AxleInteractListener(
         event.isCancelled = true
 
         val pos = AxlePos(block.world.name, block.x, block.y, block.z)
+
         val previewUuid = previewByPos.remove(pos)
         if (previewUuid != null) {
             block.type = Material.AIR
             block.world.getEntity(previewUuid)?.remove()
+            return
+        }
+
+        // Funel barrier — remove funel entity and drop item
+        val funelUuid = gearManager.findFunelAtBarrier(pos)
+        if (funelUuid != null) {
+            gearManager.removeFunel(funelUuid)
             return
         }
 

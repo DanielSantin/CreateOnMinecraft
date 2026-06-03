@@ -21,4 +21,22 @@ sealed class BeltInteractor {
 
     /** A solid non-barrier block directly above this slot that prevents items from passing through. */
     object Obstacle : BeltInteractor()
+
+    /** Funel in OUT mode: pulls items from the container and puts them on the belt. */
+    data class FunelOut(val containerPos: AxlePos) : BeltInteractor()
+
+    /** Funel in IN mode: pulls items from the belt and puts them into the container. */
+    data class FunelIn(val containerPos: AxlePos) : BeltInteractor()
+
+    /**
+     * Funel in ALIGNED mode: the container is in the same direction as the belt flow.
+     * When belt moves toward the container → inserts belt items into the container.
+     * When belt moves away from the container → extracts from the container onto the belt.
+     * [alignedTowardX]/[alignedTowardZ]: unit vector from the belt slot toward the container.
+     */
+    data class FunelAuto(
+        val containerPos: AxlePos,
+        val alignedTowardX: Int,
+        val alignedTowardZ: Int
+    ) : BeltInteractor()
 }

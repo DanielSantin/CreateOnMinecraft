@@ -53,6 +53,7 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
     private val beltsByAxle = mutableMapOf<AxlePos, BeltEntry>()
     /** Reverse lookup: every belt block pos → (belt, slotIndex). O(1) for BlockPlace/Break events. */
     internal val beltBlockPos = mutableMapOf<AxlePos, Pair<BeltEntry, Int>>()
+    private val funelsByUuid = mutableMapOf<java.util.UUID, FunelEntry>()
     private var nextNetworkId = 0
     private var tickCount = 0
     private val beltDebug = false
@@ -76,6 +77,10 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
     private val pdcBeltFixedPosA = NamespacedKey(plugin, "belt_fixed_posa")  // on esteira_fixed: "wN,bx,by,bz" of posA
     private val pdcBeltItemPosA  = NamespacedKey(plugin, "belt_item_posa")   // on belt item display: "wN,bx,by,bz" of posA
     private val pdcBeltItemStack = NamespacedKey(plugin, "belt_item_stack2") // on belt item display: full ItemStack bytes
+    // Funel PDC keys
+    private val pdcFunelContainerPos = NamespacedKey(plugin, "funel_container_pos") // "wN,bx,by,bz"
+    private val pdcFunelState        = NamespacedKey(plugin, "funel_state")          // "OUT"|"IN"|"ALIGNED"
+    private val pdcFunelFace         = NamespacedKey(plugin, "funel_face")           // BlockFace name
     // Millstone inventory PDC keys
     private val pdcMsInputType  = NamespacedKey(plugin, "ms_input_type")
     private val pdcMsInputCount = NamespacedKey(plugin, "ms_input_count")
@@ -460,6 +465,29 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
     }
 
     private fun clearBeltInteractors(belt: BeltEntry) {
+        // Drop any funels connected to this belt as items
+        for ((_, interactors) in belt.interactors) {
+            for (interactor in interactors) {
+                val cPos = when (interactor) {
+                    is BeltInteractor.FunelOut  -> interactor.containerPos
+                    is BeltInteractor.FunelIn   -> interactor.containerPos
+                    is BeltInteractor.FunelAuto -> interactor.containerPos
+                    else -> null
+                } ?: continue
+                val funel = funelsByUuid.values.firstOrNull { it.containerPos == cPos } ?: continue
+                funelsByUuid.remove(funel.displayUuid)
+                val entity = plugin.server.getEntity(funel.displayUuid)
+                if (entity != null) {
+                    val barrierPos = AxlePos(entity.world.name, entity.location.blockX, entity.location.blockY, entity.location.blockZ)
+                    if (!beltBlockPos.containsKey(barrierPos)) {
+                        val block = entity.world.getBlockAt(barrierPos.bx, barrierPos.by, barrierPos.bz)
+                        if (block.type == Material.BARRIER) block.type = Material.AIR
+                    }
+                    entity.world.dropItemNaturally(entity.location, funelGiveItem())
+                    entity.remove()
+                }
+            }
+        }
         belt.allPositions.forEach { beltBlockPos.remove(it) }
         belt.interactors.clear()
     }
@@ -506,8 +534,177 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
             }
         }
 
+        // Preserve entity-based interactors (funels) — not detectable by block scan
+        belt.interactors[slotIndex]?.filterTo(list) {
+            it is BeltInteractor.FunelOut || it is BeltInteractor.FunelIn || it is BeltInteractor.FunelAuto
+        }
+
         if (list.isEmpty()) belt.interactors.remove(slotIndex)
         else belt.interactors[slotIndex] = list
+    }
+
+    // ─── Funel management ────────────────────────────────────────────────────
+
+    /** Called by [FunelInteractListener] when a player shift-right-clicks a container with a funel item. */
+    fun placeFunel(world: World, containerPos: AxlePos, face: org.bukkit.block.BlockFace): Boolean {
+        val searchPositions = listOf(
+            AxlePos(world.name, containerPos.bx + face.modX, containerPos.by + face.modY,     containerPos.bz + face.modZ),
+            AxlePos(world.name, containerPos.bx + face.modX, containerPos.by + face.modY - 1, containerPos.bz + face.modZ),
+            AxlePos(world.name, containerPos.bx + face.modX, containerPos.by + face.modY - 2, containerPos.bz + face.modZ),
+            AxlePos(world.name, containerPos.bx + face.modX, containerPos.by + face.modY + 1, containerPos.bz + face.modZ),
+        )
+        val (belt, slotIndex) = searchPositions.firstNotNullOfOrNull { beltBlockPos[it] } ?: return false
+        val beltSlotPos = belt.allPositions[slotIndex]
+
+        val posA = belt.allPositions.first()
+        val posB = belt.allPositions.last()
+        val stepX = when { posB.bx > posA.bx -> 1; posB.bx < posA.bx -> -1; else -> 0 }
+        val stepZ = when { posB.bz > posA.bz -> 1; posB.bz < posA.bz -> -1; else -> 0 }
+
+        val towardX = (containerPos.bx - beltSlotPos.bx).coerceIn(-1, 1)
+        val towardZ = (containerPos.bz - beltSlotPos.bz).coerceIn(-1, 1)
+        val isAligned = (towardX != 0 || towardZ != 0) &&
+            ((towardX == stepX && towardZ == stepZ) || (towardX == -stepX && towardZ == -stepZ))
+
+        val state = if (isAligned) FunelState.ALIGNED else FunelState.OUT
+
+        val loc = org.bukkit.Location(world,
+            containerPos.bx + 0.5 + face.modX * 0.501,
+            containerPos.by + 0.5 + face.modY * 0.501,
+            containerPos.bz + 0.5 + face.modZ * 0.501)
+        val display = world.spawn(loc, org.bukkit.entity.ItemDisplay::class.java) { e ->
+            e.itemDisplayTransform = org.bukkit.entity.ItemDisplay.ItemDisplayTransform.NONE
+            e.interpolationDuration = 0
+            e.transformation = org.bukkit.util.Transformation(
+                org.joml.Vector3f(), funelRotation(face),
+                org.joml.Vector3f(0.75f, 0.75f, 0.75f), IDENTITY_Q)
+            e.setItemStack(funelDisplayItem(state))
+        }
+        val posTag = "${containerPos.worldName},${containerPos.bx},${containerPos.by},${containerPos.bz}"
+        display.persistentDataContainer.set(pdcFunelContainerPos, PersistentDataType.STRING, posTag)
+        display.persistentDataContainer.set(pdcFunelState, PersistentDataType.STRING, state.name)
+        display.persistentDataContainer.set(pdcFunelFace, PersistentDataType.STRING, face.name)
+
+        // Place a barrier at the face-adjacent block so the player can right-click it to toggle
+        val barrierBlock = world.getBlockAt(containerPos.bx + face.modX, containerPos.by + face.modY, containerPos.bz + face.modZ)
+        if (barrierBlock.type.isAir) barrierBlock.type = Material.BARRIER
+
+        val entry = FunelEntry(display.uniqueId, containerPos, beltSlotPos, slotIndex, state)
+        funelsByUuid[display.uniqueId] = entry
+        addFunelInteractor(belt, slotIndex, containerPos, state, towardX, towardZ)
+        return true
+    }
+
+    /** Toggles the funel between OUT and IN. Does nothing if state is ALIGNED. */
+    fun toggleFunel(displayUuid: java.util.UUID) {
+        val entry = funelsByUuid[displayUuid] ?: return
+        if (entry.state == FunelState.ALIGNED) return
+
+        entry.state = if (entry.state == FunelState.OUT) FunelState.IN else FunelState.OUT
+
+        val display = (plugin.server.getEntity(displayUuid) as? org.bukkit.entity.ItemDisplay) ?: return
+        display.setItemStack(funelDisplayItem(entry.state))
+        display.persistentDataContainer.set(pdcFunelState, PersistentDataType.STRING, entry.state.name)
+
+        beltBlockPos[entry.beltSlotPos]?.let { (belt, slotIndex) ->
+            belt.interactors[slotIndex]?.removeIf {
+                it is BeltInteractor.FunelOut || it is BeltInteractor.FunelIn
+            }
+            val posA = belt.allPositions.first(); val posB = belt.allPositions.last()
+            val stepX = when { posB.bx > posA.bx -> 1; posB.bx < posA.bx -> -1; else -> 0 }
+            val stepZ = when { posB.bz > posA.bz -> 1; posB.bz < posA.bz -> -1; else -> 0 }
+            val towardX = (entry.containerPos.bx - entry.beltSlotPos.bx).coerceIn(-1, 1)
+            val towardZ = (entry.containerPos.bz - entry.beltSlotPos.bz).coerceIn(-1, 1)
+            addFunelInteractor(belt, slotIndex, entry.containerPos, entry.state, towardX, towardZ)
+        }
+    }
+
+    /** Removes the funel entity and drops a funel item. */
+    fun removeFunel(displayUuid: java.util.UUID) {
+        val entry = funelsByUuid.remove(displayUuid)
+        if (entry != null) {
+            beltBlockPos[entry.beltSlotPos]?.let { (belt, slotIndex) ->
+                belt.interactors[slotIndex]?.removeIf { interactor ->
+                    (interactor is BeltInteractor.FunelOut  && interactor.containerPos == entry.containerPos) ||
+                    (interactor is BeltInteractor.FunelIn   && interactor.containerPos == entry.containerPos) ||
+                    (interactor is BeltInteractor.FunelAuto && interactor.containerPos == entry.containerPos)
+                }
+                if (belt.interactors[slotIndex]?.isEmpty() == true) belt.interactors.remove(slotIndex)
+            }
+        }
+        // Always remove the entity and drop the item, even if not tracked in memory
+        val entity = plugin.server.getEntity(displayUuid)
+        if (entity != null) {
+            val barrierPos = AxlePos(entity.world.name, entity.location.blockX, entity.location.blockY, entity.location.blockZ)
+            if (!beltBlockPos.containsKey(barrierPos)) {
+                val block = entity.world.getBlockAt(barrierPos.bx, barrierPos.by, barrierPos.bz)
+                if (block.type == Material.BARRIER) block.type = Material.AIR
+            }
+            entity.world.dropItemNaturally(entity.location, funelGiveItem())
+            entity.remove()
+        }
+    }
+
+    fun isFunelDisplayEntity(entity: org.bukkit.entity.ItemDisplay): Boolean =
+        entity.persistentDataContainer.has(pdcFunelContainerPos, PersistentDataType.STRING)
+
+    /** Finds a funel on a specific face of a container. Returns the display UUID or null. */
+    fun findFunelOnContainer(containerPos: AxlePos, face: org.bukkit.block.BlockFace): java.util.UUID? =
+        findFunelAtBarrier(AxlePos(containerPos.worldName,
+            containerPos.bx + face.modX,
+            containerPos.by + face.modY,
+            containerPos.bz + face.modZ))
+
+    /** Searches for a funel entity at [barrierPos]. Returns its UUID or null.
+     *  The funel entity spawns at containerPos + face*0.501, so it sits 0.499 blocks
+     *  from the barrier center — a radius of 0.6 is sufficient. */
+    fun findFunelAtBarrier(barrierPos: AxlePos): java.util.UUID? {
+        val world = plugin.server.getWorld(barrierPos.worldName) ?: return null
+        val center = org.bukkit.Location(world, barrierPos.bx + 0.5, barrierPos.by + 0.5, barrierPos.bz + 0.5)
+        return world.getNearbyEntities(center, 0.6, 0.6, 0.6)
+            .filterIsInstance<org.bukkit.entity.ItemDisplay>()
+            .firstOrNull { isFunelDisplayEntity(it) }
+            ?.uniqueId
+    }
+
+    private fun addFunelInteractor(
+        belt: BeltEntry, slotIndex: Int, containerPos: AxlePos,
+        state: FunelState, towardX: Int, towardZ: Int
+    ) {
+        val interactor: BeltInteractor = when (state) {
+            FunelState.OUT     -> BeltInteractor.FunelOut(containerPos)
+            FunelState.IN      -> BeltInteractor.FunelIn(containerPos)
+            FunelState.ALIGNED -> BeltInteractor.FunelAuto(containerPos, towardX, towardZ)
+        }
+        belt.interactors.getOrPut(slotIndex) { mutableListOf() }.add(interactor)
+    }
+
+    private fun funelRotation(face: org.bukkit.block.BlockFace): Quaternionf = when (face) {
+        org.bukkit.block.BlockFace.SOUTH -> RotationUtil.axisAngle(0f, 1f, 0f,   0f)
+        org.bukkit.block.BlockFace.WEST  -> RotationUtil.axisAngle(0f, 1f, 0f,  90f)
+        org.bukkit.block.BlockFace.NORTH -> RotationUtil.axisAngle(0f, 1f, 0f, 180f)
+        org.bukkit.block.BlockFace.EAST  -> RotationUtil.axisAngle(0f, 1f, 0f, 270f)
+        org.bukkit.block.BlockFace.UP    -> RotationUtil.axisAngle(1f, 0f, 0f, -90f)
+        org.bukkit.block.BlockFace.DOWN  -> RotationUtil.axisAngle(1f, 0f, 0f,  90f)
+        else                             -> Quaternionf()
+    }
+
+    private fun funelDisplayItem(state: FunelState): org.bukkit.inventory.ItemStack {
+        val modelId = if (state == FunelState.IN) "states/funel_in" else "states/funel_out"
+        val stack = org.bukkit.inventory.ItemStack(Material.STICK)
+        val meta = stack.itemMeta ?: return stack
+        meta.setItemModel(NamespacedKey("ssggearmachine", modelId))
+        stack.itemMeta = meta
+        return stack
+    }
+
+    internal fun funelGiveItem(): org.bukkit.inventory.ItemStack {
+        val stack = org.bukkit.inventory.ItemStack(Material.STICK)
+        val meta = stack.itemMeta ?: return stack
+        meta.setItemModel(NamespacedKey("ssggearmachine", "funel"))
+        meta.setDisplayName("§rFunel")
+        stack.itemMeta = meta
+        return stack
     }
 
     fun addAxleToBelt(world: World, pos: AxlePos): Boolean {
@@ -563,9 +760,6 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         val stepX = when { posB.bx > posA.bx -> 1; posB.bx < posA.bx -> -1; else -> 0 }
         val stepZ = when { posB.bz > posA.bz -> 1; posB.bz < posA.bz -> -1; else -> 0 }
 
-        if (tickCount % 4 == 0) pickupItemEntities(world, belt, posA, stepX, stepZ)
-        if (tickCount % 8 == 0) tickBeltInteractorsInsert(world, belt, posA, stepX, stepZ)
-
         val refEntry = gearsByPos[belt.axlePositions.firstOrNull() ?: return] ?: return
         val baseDpt  = networks[refEntry.networkId]?.lastBaseDpt ?: 0f
         val beltTag  = "belt[${posA.bx},${posA.by},${posA.bz}→${posB.bx},${posB.bz}]"
@@ -581,10 +775,14 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
             AxleAxis.Y -> (stepX - stepZ).toFloat()
         }
         val signedSpeed = baseDpt * refEntry.speedMultiplier * dirSign * BELT_SPEED_FACTOR
+        val forward = signedSpeed > 0f   // true = A→B, false = B→A
+
+        if (tickCount % 4 == 0) pickupItemEntities(world, belt, posA, stepX, stepZ)
+        if (tickCount % 8 == 0) tickBeltInteractorsInsert(world, belt, posA, stepX, stepZ, forward)
+
         if (signedSpeed == 0f || belt.items.isEmpty()) return
 
-        val speed   = kotlin.math.abs(signedSpeed)
-        val forward = signedSpeed > 0f   // true = A→B, false = B→A
+        val speed = kotlin.math.abs(signedSpeed)
         if (beltDebug && belt.items.isNotEmpty())
             plugin.logger.info("[BeltDBG] $beltTag tick=$tickCount items=${belt.items.size} speed=${"%.4f".format(speed)} forward=$forward")
 
@@ -676,7 +874,7 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
                 } else {
                     // Hopper at the last slot has priority over dropping
                     val lastSlot = endBeltP.toInt().coerceIn(0, belt.allPositions.size - 1)
-                    if (tryExtractBeltItem(world, belt, item, lastSlot, toRemove)) continue
+                    if (tryExtractBeltItem(world, belt, item, lastSlot, toRemove, forward, stepX, stepZ)) continue
 
                     val endBlock = world.getBlockAt(endPos.bx + exitX, endPos.by, endPos.bz + exitZ)
                     if (beltDebug) plugin.logger.info("[BeltDBG]   item[$itemId] END solid=${endBlock.type.isSolid} block=${endBlock.type}")
@@ -696,7 +894,7 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
 
             // ── Extract interactors: hopper below this slot pulls item out ────
             val currentSlot = item.beltPos.toInt().coerceIn(0, belt.allPositions.size - 1)
-            if (tryExtractBeltItem(world, belt, item, currentSlot, toRemove)) continue
+            if (tryExtractBeltItem(world, belt, item, currentSlot, toRemove, forward, stepX, stepZ)) continue
 
             // ── Normal movement along the belt ───────────────────────────────
             val frontItem = if (i > 0 && belt.items[i - 1] !in toRemove) belt.items[i - 1] else null
@@ -766,16 +964,33 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         }
     }
 
-    private fun tickBeltInteractorsInsert(world: World, belt: BeltEntry, posA: AxlePos, stepX: Int, stepZ: Int) {
+    private fun tickBeltInteractorsInsert(
+        world: World, belt: BeltEntry, posA: AxlePos, stepX: Int, stepZ: Int, forward: Boolean
+    ) {
         for ((slotIndex, interactors) in belt.interactors) {
             val slotPos = slotIndex.toFloat()
             if (belt.items.any { kotlin.math.abs(it.beltPos - slotPos) < 0.5f }) continue
             for (interactor in interactors) {
-                if (interactor !is BeltInteractor.HopperInsert) continue
-                val hPos = interactor.hopperPos
-                val block = world.getBlockAt(hPos.bx, hPos.by, hPos.bz)
-                if (block.type != Material.HOPPER) continue
-                val inv = (block.state as? org.bukkit.block.Hopper)?.inventory ?: continue
+                val inv = when (interactor) {
+                    is BeltInteractor.HopperInsert -> {
+                        val block = world.getBlockAt(interactor.hopperPos.bx, interactor.hopperPos.by, interactor.hopperPos.bz)
+                        if (block.type != Material.HOPPER) continue
+                        (block.state as? org.bukkit.block.Hopper)?.inventory
+                    }
+                    is BeltInteractor.FunelOut -> {
+                        val cPos = interactor.containerPos
+                        (world.getBlockAt(cPos.bx, cPos.by, cPos.bz).state as? org.bukkit.block.Container)?.inventory
+                    }
+                    is BeltInteractor.FunelAuto -> {
+                        // ALIGNED extract: belt moving AWAY from container
+                        val travelingToward = (forward && interactor.alignedTowardX == stepX && interactor.alignedTowardZ == stepZ) ||
+                            (!forward && interactor.alignedTowardX == -stepX && interactor.alignedTowardZ == -stepZ)
+                        if (travelingToward) continue  // insert direction handled by tryExtractBeltItem
+                        val cPos = interactor.containerPos
+                        (world.getBlockAt(cPos.bx, cPos.by, cPos.bz).state as? org.bukkit.block.Container)?.inventory
+                    }
+                    else -> continue
+                } ?: continue
                 for (i in 0 until inv.size) {
                     val stack = inv.getItem(i) ?: continue
                     if (stack.type.isAir) continue
@@ -792,15 +1007,31 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
 
     private fun tryExtractBeltItem(
         world: World, belt: BeltEntry, item: BeltItem,
-        slotIndex: Int, toRemove: MutableList<BeltItem>
+        slotIndex: Int, toRemove: MutableList<BeltItem>,
+        forward: Boolean, stepX: Int, stepZ: Int
     ): Boolean {
         val interactors = belt.interactors[slotIndex] ?: return false
         for (interactor in interactors) {
-            if (interactor !is BeltInteractor.HopperExtract) continue
-            val hPos = interactor.hopperPos
-            val block = world.getBlockAt(hPos.bx, hPos.by, hPos.bz)
-            if (block.type != Material.HOPPER) continue
-            val inv = (block.state as? org.bukkit.block.Hopper)?.inventory ?: continue
+            val inv = when (interactor) {
+                is BeltInteractor.HopperExtract -> {
+                    val block = world.getBlockAt(interactor.hopperPos.bx, interactor.hopperPos.by, interactor.hopperPos.bz)
+                    if (block.type != Material.HOPPER) continue
+                    (block.state as? org.bukkit.block.Hopper)?.inventory
+                }
+                is BeltInteractor.FunelIn -> {
+                    val cPos = interactor.containerPos
+                    (world.getBlockAt(cPos.bx, cPos.by, cPos.bz).state as? org.bukkit.block.Container)?.inventory
+                }
+                is BeltInteractor.FunelAuto -> {
+                    // ALIGNED insert: belt moving TOWARD container
+                    val travelingToward = (forward && interactor.alignedTowardX == stepX && interactor.alignedTowardZ == stepZ) ||
+                        (!forward && interactor.alignedTowardX == -stepX && interactor.alignedTowardZ == -stepZ)
+                    if (!travelingToward) continue
+                    val cPos = interactor.containerPos
+                    (world.getBlockAt(cPos.bx, cPos.by, cPos.bz).state as? org.bukkit.block.Container)?.inventory
+                }
+                else -> continue
+            } ?: continue
             val overflow = inv.addItem(item.item.clone())
             if (overflow.isEmpty()) {
                 (item.cachedDisplay?.takeIf { it.isValid }
@@ -1481,6 +1712,62 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
 
         if (beltCount > 0)
             plugin.logger.info("Restored $beltCount belt(s) from loaded chunks.")
+
+        restoreFunelsFromWorld()
+    }
+
+    private fun restoreFunelsFromWorld() {
+        var count = 0
+        for (world in plugin.server.worlds) {
+            for (entity in world.entities) {
+                if (entity !is ItemDisplay) continue
+                val pdc = entity.persistentDataContainer
+                val containerTag = pdc.get(pdcFunelContainerPos, PersistentDataType.STRING) ?: continue
+                val containerPos = parseAxlePos(containerTag) ?: continue
+                val stateStr = pdc.get(pdcFunelState, PersistentDataType.STRING) ?: continue
+                val state = runCatching { FunelState.valueOf(stateStr) }.getOrNull() ?: continue
+                if (funelsByUuid.containsKey(entity.uniqueId)) continue  // already restored
+
+                // Restore rotation from saved face
+                val faceName = pdc.get(pdcFunelFace, PersistentDataType.STRING)
+                val savedFace = faceName?.let { runCatching { org.bukkit.block.BlockFace.valueOf(it) }.getOrNull() }
+                if (savedFace != null) {
+                    entity.transformation = org.bukkit.util.Transformation(
+                        entity.transformation.translation, funelRotation(savedFace),
+                        entity.transformation.scale, IDENTITY_Q)
+                }
+
+                // Derive barrier pos from entity block coordinates (entity spawned at containerPos + face*0.501)
+                val barrierPos = AxlePos(world.name, entity.location.blockX, entity.location.blockY, entity.location.blockZ)
+
+                // Find the belt slot — search from barrier toward the direction it came from (container → barrier)
+                val faceModX = (barrierPos.bx - containerPos.bx).coerceIn(-1, 1)
+                val faceModY = (barrierPos.by - containerPos.by).coerceIn(-1, 1)
+                val faceModZ = (barrierPos.bz - containerPos.bz).coerceIn(-1, 1)
+                val searchPositions = listOf(
+                    AxlePos(world.name, barrierPos.bx + faceModX, barrierPos.by + faceModY,     barrierPos.bz + faceModZ),
+                    AxlePos(world.name, barrierPos.bx,            barrierPos.by + faceModY - 1, barrierPos.bz           ),
+                    AxlePos(world.name, barrierPos.bx + faceModX, barrierPos.by + faceModY - 1, barrierPos.bz + faceModZ),
+                    AxlePos(world.name, barrierPos.bx + faceModX, barrierPos.by + faceModY + 1, barrierPos.bz + faceModZ),
+                    barrierPos,
+                )
+                val (belt, slotIndex) = searchPositions.firstNotNullOfOrNull { beltBlockPos[it] } ?: continue
+                val beltSlotPos = belt.allPositions[slotIndex]
+
+                val posA = belt.allPositions.first()
+                val posB = belt.allPositions.last()
+                val stepX = when { posB.bx > posA.bx -> 1; posB.bx < posA.bx -> -1; else -> 0 }
+                val stepZ = when { posB.bz > posA.bz -> 1; posB.bz < posA.bz -> -1; else -> 0 }
+                val towardX = (containerPos.bx - beltSlotPos.bx).coerceIn(-1, 1)
+                val towardZ = (containerPos.bz - beltSlotPos.bz).coerceIn(-1, 1)
+
+                val entry = FunelEntry(entity.uniqueId, containerPos, beltSlotPos, slotIndex, state)
+                funelsByUuid[entity.uniqueId] = entry
+                addFunelInteractor(belt, slotIndex, containerPos, state, towardX, towardZ)
+                count++
+            }
+        }
+        if (count > 0) plugin.logger.info("Restored $count funel(s) from loaded chunks.")
     }
 
     private fun restoreBelt(posA: AxlePos, posB: AxlePos, fixedUuids: List<UUID>): Boolean {

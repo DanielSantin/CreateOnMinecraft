@@ -7,6 +7,7 @@ import dev.createonmc.commands.SSGItemCommand
 import dev.createonmc.gear.GearManager
 import dev.createonmc.listeners.AxleInteractListener
 import dev.createonmc.listeners.BeltBlockListener
+import dev.createonmc.listeners.FunelInteractListener
 import dev.createonmc.listeners.GearChunkListener
 import dev.createonmc.listeners.WaterDebugListener
 import org.bukkit.plugin.java.JavaPlugin
@@ -23,6 +24,7 @@ class CreateOnMinecraftPlugin : JavaPlugin() {
         server.pluginManager.registerEvents(AxleInteractListener(gearManager, stressCommand, ssgItemCommand), this)
         server.pluginManager.registerEvents(GearChunkListener(gearManager), this)
         server.pluginManager.registerEvents(BeltBlockListener(gearManager, this), this)
+        server.pluginManager.registerEvents(FunelInteractListener(gearManager, this), this)
         server.pluginManager.registerEvents(WaterDebugListener(logger), this)
         val ssgGive = SSGGiveCommand()
         getCommand("ssggive")?.setExecutor(ssgGive)
