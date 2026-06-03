@@ -23,16 +23,12 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         val PIVOT = Vector3f(0.5f, 0.5f, 0.5f)
         val SCALE = Vector3f(1f, 1f, 1f)
         val IDENTITY_Q = Quaternionf(0f, 0f, 0f, 1f)
-        private const val MAX_STEP_TICKS = 4
-        private const val MAX_STEP_ANGLE = 90f
         const val WATER_WHEEL_RPM = 16f
 
         // ── Stress values (SU per RPM), matching Create mod ──────────────────
         const val STRESS_CAPACITY_WATER_WHEEL = 16f   // SU generated per RPM
         const val STRESS_CAPACITY_MOTOR       = 256f  // SU generated per RPM (creative-style)
         const val STRESS_IMPACT_MILLSTONE     = 4f    // SU consumed per RPM
-        private const val TICKS_PER_MINUTE    = 20f * 60f
-        private const val DPT_TO_RPM          = TICKS_PER_MINUTE / 360f  // multiply dpt → rpm
 
         // ── Belt item transport ───────────────────────────────────────────────
         private const val BELT_ITEM_Y_OFFSET  = 0.375f  // entity at by+0.5 → item center at by+0.875 (14/16)
@@ -48,14 +44,13 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         GearType.values().associateWith { listOf(Triple(0, 0, 0)) }
 
     private val gearsByPos = mutableMapOf<AxlePos, GearEntry>()
-    val networks = mutableMapOf<Int, GearNetwork>()
     val millstoneData = mutableMapOf<AxlePos, MillstoneData>()
     private val beltsByAxle = mutableMapOf<AxlePos, BeltEntry>()
     /** Reverse lookup: every belt block pos → (belt, slotIndex). O(1) for BlockPlace/Break events. */
     internal val beltBlockPos = mutableMapOf<AxlePos, Pair<BeltEntry, Int>>()
-    private val funelsByUuid = mutableMapOf<java.util.UUID, FunelEntry>()
-    private val funelsByContainerPos = mutableMapOf<AxlePos, java.util.UUID>()
-    private var nextNetworkId = 0
+    val funel = FunelManager(plugin, beltBlockPos)
+    private val networkMgr = GearNetworkManager(plugin, gearsByPos, beltsByAxle) { w, bx, by, bz -> removeGear(w, bx, by, bz) }
+    val networks get() = networkMgr.networks
     private var tickCount = 0
     private val beltDebug = false
     // Belt restoration is debounced: fires 20 ticks after the last chunk load so all
@@ -78,10 +73,6 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
     private val pdcBeltFixedPosA = NamespacedKey(plugin, "belt_fixed_posa")  // on esteira_fixed: "wN,bx,by,bz" of posA
     private val pdcBeltItemPosA  = NamespacedKey(plugin, "belt_item_posa")   // on belt item display: "wN,bx,by,bz" of posA
     private val pdcBeltItemStack = NamespacedKey(plugin, "belt_item_stack2") // on belt item display: full ItemStack bytes
-    // Funel PDC keys
-    private val pdcFunelContainerPos = NamespacedKey(plugin, "funel_container_pos") // "wN,bx,by,bz"
-    private val pdcFunelState        = NamespacedKey(plugin, "funel_state")          // "OUT"|"IN"|"ALIGNED"
-    private val pdcFunelFace         = NamespacedKey(plugin, "funel_face")           // BlockFace name
     // Millstone inventory PDC keys
     private val pdcMsInputType  = NamespacedKey(plugin, "ms_input_type")
     private val pdcMsInputCount = NamespacedKey(plugin, "ms_input_count")
@@ -466,29 +457,7 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
     }
 
     private fun clearBeltInteractors(belt: BeltEntry) {
-        // Drop any funels connected to this belt as items
-        for ((_, interactors) in belt.interactors) {
-            for (interactor in interactors) {
-                val cPos = when (interactor) {
-                    is BeltInteractor.FunelOut  -> interactor.containerPos
-                    is BeltInteractor.FunelIn   -> interactor.containerPos
-                    is BeltInteractor.FunelAuto -> interactor.containerPos
-                    else -> null
-                } ?: continue
-                val funelUuid = funelsByContainerPos.remove(cPos) ?: continue
-                val funel = funelsByUuid.remove(funelUuid) ?: continue
-                val entity = plugin.server.getEntity(funel.displayUuid)
-                if (entity != null) {
-                    val barrierPos = AxlePos(entity.world.name, entity.location.blockX, entity.location.blockY, entity.location.blockZ)
-                    if (!beltBlockPos.containsKey(barrierPos)) {
-                        val block = entity.world.getBlockAt(barrierPos.bx, barrierPos.by, barrierPos.bz)
-                        if (block.type == Material.BARRIER) block.type = Material.AIR
-                    }
-                    entity.world.dropItemNaturally(entity.location, funelGiveItem())
-                    entity.remove()
-                }
-            }
-        }
+        funel.dropFunelsForBelt(belt)
         belt.allPositions.forEach { beltBlockPos.remove(it) }
         belt.interactors.clear()
     }
@@ -544,161 +513,23 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         else belt.interactors[slotIndex] = list
     }
 
-    // ─── Funel management ────────────────────────────────────────────────────
+    // ─── Funel management (delegated to FunelManager) ────────────────────────
 
-    /** Called by [FunelInteractListener] when a player shift-right-clicks a container with a funel item. */
-    fun placeFunel(world: World, containerPos: AxlePos, face: org.bukkit.block.BlockFace): Boolean {
-        val searchPositions = listOf(
-            AxlePos(world.name, containerPos.bx + face.modX, containerPos.by + face.modY,     containerPos.bz + face.modZ),
-            AxlePos(world.name, containerPos.bx + face.modX, containerPos.by + face.modY - 1, containerPos.bz + face.modZ),
-            AxlePos(world.name, containerPos.bx + face.modX, containerPos.by + face.modY - 2, containerPos.bz + face.modZ),
-            AxlePos(world.name, containerPos.bx + face.modX, containerPos.by + face.modY + 1, containerPos.bz + face.modZ),
-        )
-        val (belt, slotIndex) = searchPositions.firstNotNullOfOrNull { beltBlockPos[it] } ?: return false
-        val beltSlotPos = belt.allPositions[slotIndex]
+    fun placeFunel(world: World, containerPos: AxlePos, face: org.bukkit.block.BlockFace): Boolean =
+        funel.placeFunel(world, containerPos, face)
 
-        val posA = belt.allPositions.first()
-        val posB = belt.allPositions.last()
-        val stepX = when { posB.bx > posA.bx -> 1; posB.bx < posA.bx -> -1; else -> 0 }
-        val stepZ = when { posB.bz > posA.bz -> 1; posB.bz < posA.bz -> -1; else -> 0 }
+    fun toggleFunel(displayUuid: java.util.UUID) = funel.toggleFunel(displayUuid)
 
-        val towardX = (containerPos.bx - beltSlotPos.bx).coerceIn(-1, 1)
-        val towardZ = (containerPos.bz - beltSlotPos.bz).coerceIn(-1, 1)
-        val isAligned = (towardX != 0 || towardZ != 0) &&
-            ((towardX == stepX && towardZ == stepZ) || (towardX == -stepX && towardZ == -stepZ))
-
-        val state = if (isAligned) FunelState.ALIGNED else FunelState.OUT
-
-        val loc = org.bukkit.Location(world,
-            containerPos.bx + 0.5 + face.modX * 0.501,
-            containerPos.by + 0.5 + face.modY * 0.501,
-            containerPos.bz + 0.5 + face.modZ * 0.501)
-        val display = world.spawn(loc, org.bukkit.entity.ItemDisplay::class.java) { e ->
-            e.itemDisplayTransform = org.bukkit.entity.ItemDisplay.ItemDisplayTransform.NONE
-            e.interpolationDuration = 0
-            e.transformation = org.bukkit.util.Transformation(
-                org.joml.Vector3f(), RotationUtil.fromBlockFace(face),
-                org.joml.Vector3f(0.75f, 0.75f, 0.75f), IDENTITY_Q)
-            e.setItemStack(funelDisplayItem(state))
-        }
-        val posTag = "${containerPos.worldName},${containerPos.bx},${containerPos.by},${containerPos.bz}"
-        display.persistentDataContainer.set(pdcFunelContainerPos, PersistentDataType.STRING, posTag)
-        display.persistentDataContainer.set(pdcFunelState, PersistentDataType.STRING, state.name)
-        display.persistentDataContainer.set(pdcFunelFace, PersistentDataType.STRING, face.name)
-
-        // Place a barrier at the face-adjacent block so the player can right-click it to toggle
-        val barrierBlock = world.getBlockAt(containerPos.bx + face.modX, containerPos.by + face.modY, containerPos.bz + face.modZ)
-        if (barrierBlock.type.isAir) barrierBlock.type = Material.BARRIER
-
-        val entry = FunelEntry(display.uniqueId, containerPos, beltSlotPos, slotIndex, state, face)
-        funelsByUuid[display.uniqueId] = entry
-        funelsByContainerPos[containerPos] = display.uniqueId
-        addFunelInteractor(belt, slotIndex, containerPos, state, towardX, towardZ)
-        return true
-    }
-
-    /** Toggles the funel between OUT and IN. Does nothing if state is ALIGNED. */
-    fun toggleFunel(displayUuid: java.util.UUID) {
-        val entry = funelsByUuid[displayUuid] ?: return
-        if (entry.state == FunelState.ALIGNED) return
-
-        entry.state = if (entry.state == FunelState.OUT) FunelState.IN else FunelState.OUT
-
-        val display = (plugin.server.getEntity(displayUuid) as? org.bukkit.entity.ItemDisplay) ?: return
-        display.setItemStack(funelDisplayItem(entry.state))
-        display.persistentDataContainer.set(pdcFunelState, PersistentDataType.STRING, entry.state.name)
-
-        beltBlockPos[entry.beltSlotPos]?.let { (belt, slotIndex) ->
-            belt.interactors[slotIndex]?.removeIf {
-                it is BeltInteractor.FunelOut || it is BeltInteractor.FunelIn
-            }
-            val posA = belt.allPositions.first(); val posB = belt.allPositions.last()
-            val stepX = when { posB.bx > posA.bx -> 1; posB.bx < posA.bx -> -1; else -> 0 }
-            val stepZ = when { posB.bz > posA.bz -> 1; posB.bz < posA.bz -> -1; else -> 0 }
-            val towardX = (entry.containerPos.bx - entry.beltSlotPos.bx).coerceIn(-1, 1)
-            val towardZ = (entry.containerPos.bz - entry.beltSlotPos.bz).coerceIn(-1, 1)
-            addFunelInteractor(belt, slotIndex, entry.containerPos, entry.state, towardX, towardZ)
-        }
-    }
-
-    /** Removes the funel entity and drops a funel item. */
-    fun removeFunel(displayUuid: java.util.UUID) {
-        val entry = funelsByUuid.remove(displayUuid)
-        if (entry != null) {
-            funelsByContainerPos.remove(entry.containerPos)
-            beltBlockPos[entry.beltSlotPos]?.let { (belt, slotIndex) ->
-                belt.interactors[slotIndex]?.removeIf { interactor ->
-                    (interactor is BeltInteractor.FunelOut  && interactor.containerPos == entry.containerPos) ||
-                    (interactor is BeltInteractor.FunelIn   && interactor.containerPos == entry.containerPos) ||
-                    (interactor is BeltInteractor.FunelAuto && interactor.containerPos == entry.containerPos)
-                }
-                if (belt.interactors[slotIndex]?.isEmpty() == true) belt.interactors.remove(slotIndex)
-            }
-        }
-        // Always remove the entity and drop the item, even if not tracked in memory
-        val entity = plugin.server.getEntity(displayUuid)
-        if (entity != null) {
-            val barrierPos = AxlePos(entity.world.name, entity.location.blockX, entity.location.blockY, entity.location.blockZ)
-            if (!beltBlockPos.containsKey(barrierPos)) {
-                val block = entity.world.getBlockAt(barrierPos.bx, barrierPos.by, barrierPos.bz)
-                if (block.type == Material.BARRIER) block.type = Material.AIR
-            }
-            entity.world.dropItemNaturally(entity.location, funelGiveItem())
-            entity.remove()
-        }
-    }
+    fun removeFunel(displayUuid: java.util.UUID) = funel.removeFunel(displayUuid)
 
     fun isFunelDisplayEntity(entity: org.bukkit.entity.ItemDisplay): Boolean =
-        entity.persistentDataContainer.has(pdcFunelContainerPos, PersistentDataType.STRING)
+        funel.isFunelDisplayEntity(entity)
 
-    /** Finds a funel on a specific face of a container. Returns the display UUID or null. */
     fun findFunelOnContainer(containerPos: AxlePos, face: org.bukkit.block.BlockFace): java.util.UUID? =
-        findFunelAtBarrier(AxlePos(containerPos.worldName,
-            containerPos.bx + face.modX,
-            containerPos.by + face.modY,
-            containerPos.bz + face.modZ))
+        funel.findFunelOnContainer(containerPos, face)
 
-    /** Searches for a funel entity at [barrierPos]. Returns its UUID or null.
-     *  The funel entity spawns at containerPos + face*0.501, so it sits 0.499 blocks
-     *  from the barrier center — a radius of 0.6 is sufficient. */
-    fun findFunelAtBarrier(barrierPos: AxlePos): java.util.UUID? {
-        val world = plugin.server.getWorld(barrierPos.worldName) ?: return null
-        val center = org.bukkit.Location(world, barrierPos.bx + 0.5, barrierPos.by + 0.5, barrierPos.bz + 0.5)
-        return world.getNearbyEntities(center, 0.6, 0.6, 0.6)
-            .filterIsInstance<org.bukkit.entity.ItemDisplay>()
-            .firstOrNull { isFunelDisplayEntity(it) }
-            ?.uniqueId
-    }
-
-    private fun addFunelInteractor(
-        belt: BeltEntry, slotIndex: Int, containerPos: AxlePos,
-        state: FunelState, towardX: Int, towardZ: Int
-    ) {
-        val interactor: BeltInteractor = when (state) {
-            FunelState.OUT     -> BeltInteractor.FunelOut(containerPos)
-            FunelState.IN      -> BeltInteractor.FunelIn(containerPos)
-            FunelState.ALIGNED -> BeltInteractor.FunelAuto(containerPos, towardX, towardZ)
-        }
-        belt.interactors.getOrPut(slotIndex) { mutableListOf() }.add(interactor)
-    }
-
-    private fun funelDisplayItem(state: FunelState): org.bukkit.inventory.ItemStack {
-        val modelId = if (state == FunelState.IN) "states/funel_in" else "states/funel_out"
-        val stack = org.bukkit.inventory.ItemStack(Material.STICK)
-        val meta = stack.itemMeta ?: return stack
-        meta.setItemModel(NamespacedKey("ssggearmachine", modelId))
-        stack.itemMeta = meta
-        return stack
-    }
-
-    internal fun funelGiveItem(): org.bukkit.inventory.ItemStack {
-        val stack = org.bukkit.inventory.ItemStack(Material.STICK)
-        val meta = stack.itemMeta ?: return stack
-        meta.setItemModel(NamespacedKey("ssggearmachine", "funel"))
-        meta.setDisplayName("§rFunel")
-        stack.itemMeta = meta
-        return stack
-    }
+    fun findFunelAtBarrier(barrierPos: AxlePos): java.util.UUID? =
+        funel.findFunelAtBarrier(barrierPos)
 
     fun addAxleToBelt(world: World, pos: AxlePos): Boolean {
         val belt = beltsByAxle[pos] ?: return false
@@ -1096,341 +927,18 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
     private fun beltItemRotation(stepX: Int, stepZ: Int): Quaternionf =
         RotationUtil.axisAngle(1f, 0f, 0f, -90f)
 
-    // ─── Network logic ───────────────────────────────────────────────────────
+    // ─── Network logic (delegated to GearNetworkManager) ─────────────────────
 
-    private fun connectGear(entry: GearEntry): Boolean {
-        val connections = findNeighborConnections(entry.pos, entry.axis, entry.gearType)
-
-        if (connections.isEmpty()) {
-            assignToNetwork(entry, createNetwork(), mult = 1.0f)
-            return true
-        }
-
-        val byNetwork = connections
-            .mapNotNull { (nPos, isAxial) -> gearsByPos[nPos]?.let { Triple(it.networkId, nPos, isAxial) } }
-            .filter { it.first != -1 }
-            .groupBy { it.first }
-
-        if (byNetwork.isEmpty()) {
-            assignToNetwork(entry, createNetwork(), mult = 1.0f)
-            return true
-        }
-
-        val (primaryId, primaryConns) = byNetwork.entries.first()
-        val (_, firstNPos, firstIsAxial) = primaryConns.first()
-        val firstNeighbor = gearsByPos[firstNPos]!!
-        val myMult = computeMyMult(entry, firstNeighbor, firstIsAxial)
-
-        // Detect gear-locking: every additional connection within the same network must imply the same myMult.
-        // Multiple connections to different networks are fine (handled via correction below).
-        for ((netId, conns) in byNetwork) {
-            val refMult = if (netId == primaryId) myMult else {
-                val (_, rPos, rAxial) = conns.first()
-                computeMyMult(entry, gearsByPos[rPos]!!, rAxial)
-            }
-            val extraConns = if (netId == primaryId) conns.drop(1) else conns.drop(1)
-            for ((_, nPos, isAxial) in extraConns) {
-                val neighbor = gearsByPos[nPos] ?: continue
-                val expected = computeMyMult(entry, neighbor, isAxial)
-                if (kotlin.math.abs(refMult - expected) > 0.001f) {
-                    val w = plugin.server.getWorld(entry.pos.worldName) ?: break
-                    plugin.server.broadcastMessage(
-                        "§c[Create] Gear locked! Block at (${entry.pos.bx}, ${entry.pos.by}, ${entry.pos.bz}) broke.")
-                    removeGear(w, entry.pos.bx, entry.pos.by, entry.pos.bz)
-                    return false
-                }
-            }
-        }
-
-        val primaryNetwork = networks[primaryId]!!
-        assignToNetwork(entry, primaryNetwork, mult = myMult)
-
-        for ((otherId, otherConns) in byNetwork) {
-            if (otherId == primaryId) continue
-            val (_, otherNPos, otherIsAxial) = otherConns.first()
-            val otherNeighbor = gearsByPos[otherNPos]!!
-            val expectedMyMultFromOther = computeMyMult(entry, otherNeighbor, otherIsAxial)
-            val correction = myMult / expectedMyMultFromOther
-            mergeInto(primaryNetwork, networks[otherId]!!, correction)
-        }
-
-        if (checkMotorConflict(primaryNetwork, bridgePos = entry.pos)) return false
-        return true
-    }
-
-    private fun computeMyMult(myEntry: GearEntry, neighbor: GearEntry, isAxial: Boolean): Float {
-        val neighborMult = neighbor.speedMultiplier
-        return when {
-            isAxial -> neighborMult
-            myEntry.axis != neighbor.axis -> neighborMult * bevelRatioSign(myEntry.pos, myEntry.axis, neighbor.pos, neighbor.axis)
-            else -> neighborMult * lateralRatio(myEntry.gearType, neighbor.gearType)
-        }
-    }
-
-    // ratio = sign of (offset·axisA) × (offset·axisB); derived from rim-velocity matching at bevel contact
-    private fun bevelRatioSign(posA: AxlePos, axisA: AxleAxis, posB: AxlePos, axisB: AxleAxis): Float {
-        val dx = posB.bx - posA.bx
-        val dy = posB.by - posA.by
-        val dz = posB.bz - posA.bz
-        val (ax1, ay1, az1) = axisA.positiveOffset()
-        val (ax2, ay2, az2) = axisB.positiveOffset()
-        val vA = dx * ax1 + dy * ay1 + dz * az1
-        val vB = dx * ax2 + dy * ay2 + dz * az2
-        return if (vA * vB > 0) 1f else -1f
-    }
-
-    // Returns the speed ratio of `myType` relative to `neighborType` for a lateral (meshing) connection.
-    // Sign is always negative (opposite rotation). Magnitude is the gear ratio.
-    // MILLSTONE is treated as COGWHEEL for ratio purposes (same tooth-ring size)
-    private fun lateralRatio(myType: GearType, neighborType: GearType): Float {
-        val my = if (myType == GearType.MILLSTONE) GearType.COGWHEEL else myType
-        val nb = if (neighborType == GearType.MILLSTONE) GearType.COGWHEEL else neighborType
-        return when {
-            my == GearType.COGWHEEL       && nb == GearType.COGWHEEL       -> -1.0f
-            my == GearType.LARGE_COGWHEEL && nb == GearType.LARGE_COGWHEEL -> -1.0f
-            my == GearType.COGWHEEL       && nb == GearType.LARGE_COGWHEEL -> -2.0f
-            else                                                            -> -0.5f
-        }
-    }
-
-    private fun rebuildNetworks(oldId: Int) {
-        val old = networks.remove(oldId) ?: return
-        val remaining = old.members.keys.filter { it in gearsByPos }.toSet()
-        remaining.forEach { gearsByPos[it]?.networkId = -1 }
-
-        val visited = mutableSetOf<AxlePos>()
-        for (start in remaining) {
-            if (start in visited) continue
-            val net = createNetwork()
-            net.angle = old.angle
-
-            val startMult = old.members[start] ?: 1.0f
-            val queue = ArrayDeque<Pair<AxlePos, Float>>()
-            queue.add(start to startMult)
-            while (queue.isNotEmpty()) {
-                val (cur, mult) = queue.removeFirst()
-                if (cur in visited || cur !in remaining) continue
-                visited.add(cur)
-                val e = gearsByPos[cur] ?: continue
-                e.networkId = net.id; e.speedMultiplier = mult
-                net.members[cur] = mult
-                if (e.isMotor) net.motorPositions.add(cur)
-                findNeighborConnections(cur, e.axis, e.gearType).forEach { (nPos, isAxial) ->
-                    if (nPos !in visited && nPos in remaining) {
-                        val neighborE = gearsByPos[nPos] ?: return@forEach
-                        val nextMult = when {
-                            isAxial -> mult
-                            e.axis != neighborE.axis -> mult * bevelRatioSign(e.pos, e.axis, neighborE.pos, neighborE.axis)
-                            else -> mult * lateralRatio(neighborE.gearType, e.gearType)
-                        }
-                        queue.add(nPos to nextMult)
-                    }
-                }
-                // Belt connections: axles in the same belt stay linked at 1:1 ratio.
-                // Entries for a detached belt are already removed from beltsByAxle before
-                // rebuildNetworks is called, so this only follows belts that still exist.
-                beltsByAxle[cur]?.axlePositions?.forEach { bPos ->
-                    if (bPos !in visited && bPos in remaining) queue.add(bPos to mult)
-                }
-            }
-        }
-    }
-
-    private fun checkMotorConflict(network: GearNetwork, bridgePos: AxlePos): Boolean {
-        if (network.motorPositions.size < 2) return false
-        // Compute networkBaseDpt for each motor: motorSpeed / speedMultiplier
-        val baseDpts = network.motorPositions.mapNotNull { pos ->
-            val e = gearsByPos[pos] ?: return@mapNotNull null
-            if (e.speedMultiplier == 0f) null else e.motorSpeed / e.speedMultiplier
-        }
-        val hasPositive = baseDpts.any { it > 0 }
-        val hasNegative = baseDpts.any { it < 0 }
-        if (!hasPositive || !hasNegative) return false  // all same direction, no conflict
-
-        val w = plugin.server.getWorld(bridgePos.worldName) ?: return false
-        plugin.server.broadcastMessage(
-            "§c[Create] Motor conflict! Block at (${bridgePos.bx}, ${bridgePos.by}, ${bridgePos.bz}) broke.")
-        removeGear(w, bridgePos.bx, bridgePos.by, bridgePos.bz)
-        return true
-    }
-
-    // ─── Helpers ─────────────────────────────────────────────────────────────
-
-    /**
-     * Fastest motor's networkBaseDpt (signed).
-     * Returns 0 if no motor is present OR if the network is overstressed.
-     * Also updates network.stressCapacity / stressImpact as a side-effect.
-     */
-    private fun networkEffectiveDpt(network: GearNetwork): Float {
-        var best = 0f
-        for (pos in network.motorPositions) {
-            val e = gearsByPos[pos] ?: continue
-            if (e.speedMultiplier == 0f) continue
-            val baseDpt = e.motorSpeed / e.speedMultiplier
-            if (kotlin.math.abs(baseDpt) > kotlin.math.abs(best)) best = baseDpt
-        }
-        if (best == 0f) return 0f
-
-        computeNetworkStress(network, best)
-        return if (network.isOverstressed) 0f else best
-    }
-
-    /**
-     * Computes total stress capacity and impact for the network at the given baseDpt,
-     * storing results in network.stressCapacity and network.stressImpact.
-     *
-     * Stress formula (matching Create mod):
-     *   capacity/impact = baseValue × |rpm|
-     *   where rpm = baseDpt × speedMultiplier × (20×60/360)
-     *
-     * Values:
-     *   WATER_WHEEL  → +16 SU/RPM capacity
-     *   MOTOR        → +256 SU/RPM capacity  (creative-style, effectively unlimited)
-     *   MILLSTONE    → +4 SU/RPM impact
-     *   others       → no stress (pure transmission)
-     */
-    private fun computeNetworkStress(network: GearNetwork, baseDpt: Float) {
-        var capacity = 0f
-        var impact   = 0f
-        for ((pos, mult) in network.members) {
-            val entry = gearsByPos[pos] ?: continue
-            val rpm = kotlin.math.abs(baseDpt * mult) * DPT_TO_RPM
-            when (entry.gearType) {
-                GearType.WATER_WHEEL -> capacity += STRESS_CAPACITY_WATER_WHEEL * rpm
-                GearType.MOTOR       -> capacity += STRESS_CAPACITY_MOTOR       * rpm
-                GearType.MILLSTONE   -> impact   += STRESS_IMPACT_MILLSTONE     * rpm
-                else -> { /* cogwheels, axles: zero stress */ }
-            }
-        }
-        network.stressCapacity = capacity
-        network.stressImpact   = impact
-    }
-
-    // Step ticks based on the fastest visual speed across all members
-    private fun computeStepTicks(baseDpt: Float, network: GearNetwork): Int {
-        val maxMult = network.members.values.maxOfOrNull { kotlin.math.abs(it) } ?: 1.0f
-        val maxVisualDpt = kotlin.math.abs(baseDpt) * maxMult
-        return if (maxVisualDpt == 0f) MAX_STEP_TICKS
-               else (MAX_STEP_ANGLE / maxVisualDpt).toInt().coerceIn(1, MAX_STEP_TICKS)
-    }
-
-    private fun canMeshLaterally(type: GearType) =
-        type == GearType.COGWHEEL || type == GearType.LARGE_COGWHEEL || type == GearType.MILLSTONE
-
-    private fun findNeighborConnections(pos: AxlePos, axis: AxleAxis, gearType: GearType): List<Pair<AxlePos, Boolean>> {
-        val result = mutableListOf<Pair<AxlePos, Boolean>>()
-        val (ax, ay, az) = axis.positiveOffset()
-        // MILLSTONE only connects laterally, never via the axle direction
-        if (gearType != GearType.MILLSTONE) {
-            for (f in listOf(1, -1)) {
-                val n = AxlePos(pos.worldName, pos.bx + ax * f, pos.by + ay * f, pos.bz + az * f)
-                val neighbor = gearsByPos[n] ?: continue
-                if (neighbor.axis == axis && neighbor.gearType != GearType.MILLSTONE)
-                    result.add(n to true)
-            }
-        }
-        if (canMeshLaterally(gearType)) {
-            for (neighborType in listOf(GearType.COGWHEEL, GearType.LARGE_COGWHEEL, GearType.MILLSTONE)) {
-                for ((dx, dy, dz) in meshingOffsets(axis, gearType, neighborType)) {
-                    val n = AxlePos(pos.worldName, pos.bx + dx, pos.by + dy, pos.bz + dz)
-                    val neighbor = gearsByPos[n] ?: continue
-                    if (neighbor.axis == axis && neighbor.gearType == neighborType) result.add(n to false)
-                }
-            }
-        }
-        // Bevel connections: LARGE_COGWHEEL with a perpendicular-axis LARGE_COGWHEEL
-        if (gearType == GearType.LARGE_COGWHEEL) {
-            for ((offset, neighborAxis) in bevelCandidates(axis)) {
-                val (dx, dy, dz) = offset
-                val n = AxlePos(pos.worldName, pos.bx + dx, pos.by + dy, pos.bz + dz)
-                val neighbor = gearsByPos[n] ?: continue
-                if (neighbor.gearType == GearType.LARGE_COGWHEEL && neighbor.axis == neighborAxis) result.add(n to false)
-            }
-        }
-        return result
-    }
-
-    // Orthogonal distance-1 offsets in the plane perpendicular to axis (used for COGWHEEL↔COGWHEEL and blocking)
-    private fun perpendicularOffsets(axis: AxleAxis) = when (axis) {
-        AxleAxis.Y -> listOf(Triple(1,0,0), Triple(-1,0,0), Triple(0,0,1), Triple(0,0,-1))
-        AxleAxis.X -> listOf(Triple(0,1,0), Triple(0,-1,0), Triple(0,0,1), Triple(0,0,-1))
-        AxleAxis.Z -> listOf(Triple(1,0,0), Triple(-1,0,0), Triple(0,1,0), Triple(0,-1,0))
-    }
-
-    // Diagonal offsets (distance 1 in each of 2 perpendicular directions) for COGWHEEL↔LARGE_COGWHEEL
-    private fun diagonalOffsets(axis: AxleAxis) = when (axis) {
-        AxleAxis.Y -> listOf(Triple(1,0,1), Triple(1,0,-1), Triple(-1,0,1), Triple(-1,0,-1))
-        AxleAxis.X -> listOf(Triple(0,1,1), Triple(0,1,-1), Triple(0,-1,1), Triple(0,-1,-1))
-        AxleAxis.Z -> listOf(Triple(1,1,0), Triple(1,-1,0), Triple(-1,1,0), Triple(-1,-1,0))
-    }
-
-    private fun meshingOffsets(axis: AxleAxis, myType: GearType, neighborType: GearType): List<Triple<Int,Int,Int>> {
-        // Treat MILLSTONE as COGWHEEL for meshing offset calculation
-        val my = if (myType == GearType.MILLSTONE) GearType.COGWHEEL else myType
-        val nb = if (neighborType == GearType.MILLSTONE) GearType.COGWHEEL else neighborType
-        return when {
-            my == GearType.COGWHEEL       && nb == GearType.COGWHEEL       -> perpendicularOffsets(axis)
-            my == GearType.COGWHEEL       && nb == GearType.LARGE_COGWHEEL -> diagonalOffsets(axis)
-            my == GearType.LARGE_COGWHEEL && nb == GearType.COGWHEEL       -> diagonalOffsets(axis)
-            else -> emptyList()
-        }
-    }
-
-    // Bevel candidates: each entry is (offset → expected neighbor axis) for cross-axis LARGE_COGWHEEL meshing
-    private fun bevelCandidates(axis: AxleAxis): List<Pair<Triple<Int,Int,Int>, AxleAxis>> = when (axis) {
-        AxleAxis.Y -> listOf(
-            Triple( 1, 1, 0) to AxleAxis.X, Triple(-1, 1, 0) to AxleAxis.X,
-            Triple( 1,-1, 0) to AxleAxis.X, Triple(-1,-1, 0) to AxleAxis.X,
-            Triple( 0, 1, 1) to AxleAxis.Z, Triple( 0, 1,-1) to AxleAxis.Z,
-            Triple( 0,-1, 1) to AxleAxis.Z, Triple( 0,-1,-1) to AxleAxis.Z
-        )
-        AxleAxis.X -> listOf(
-            Triple( 1, 1, 0) to AxleAxis.Y, Triple(-1, 1, 0) to AxleAxis.Y,
-            Triple( 1,-1, 0) to AxleAxis.Y, Triple(-1,-1, 0) to AxleAxis.Y,
-            Triple( 1, 0, 1) to AxleAxis.Z, Triple(-1, 0, 1) to AxleAxis.Z,
-            Triple( 1, 0,-1) to AxleAxis.Z, Triple(-1, 0,-1) to AxleAxis.Z
-        )
-        AxleAxis.Z -> listOf(
-            Triple( 0, 1, 1) to AxleAxis.Y, Triple( 0,-1, 1) to AxleAxis.Y,
-            Triple( 0, 1,-1) to AxleAxis.Y, Triple( 0,-1,-1) to AxleAxis.Y,
-            Triple( 1, 0, 1) to AxleAxis.X, Triple(-1, 0, 1) to AxleAxis.X,
-            Triple( 1, 0,-1) to AxleAxis.X, Triple(-1, 0,-1) to AxleAxis.X
-        )
-    }
-
-    // A position is blocked if any LARGE_COGWHEEL with a given axis claims it as part of its footprint
-    private fun isBlockedByLargeGear(pos: AxlePos): Boolean {
-        for (axis in AxleAxis.values()) {
-            for ((dx, dy, dz) in perpendicularOffsets(axis)) {
-                val neighborPos = AxlePos(pos.worldName, pos.bx - dx, pos.by - dy, pos.bz - dz)
-                val neighbor = gearsByPos[neighborPos] ?: continue
-                if (neighbor.gearType == GearType.LARGE_COGWHEEL && neighbor.axis == axis) return true
-            }
-        }
-        return false
-    }
-
-    private fun createNetwork(): GearNetwork {
-        val net = GearNetwork(nextNetworkId++)
-        networks[net.id] = net
-        return net
-    }
-
-    private fun assignToNetwork(entry: GearEntry, network: GearNetwork, mult: Float) {
-        entry.networkId = network.id; entry.speedMultiplier = mult
-        network.members[entry.pos] = mult
-        if (entry.isMotor) network.motorPositions.add(entry.pos)
-    }
-
-    private fun mergeInto(primary: GearNetwork, secondary: GearNetwork, multCorrection: Float) {
-        for ((pos, mult) in secondary.members) {
-            val corrected = mult * multCorrection
-            primary.members[pos] = corrected
-            gearsByPos[pos]?.let { it.networkId = primary.id; it.speedMultiplier = corrected }
-        }
-        primary.motorPositions.addAll(secondary.motorPositions)
-        networks.remove(secondary.id)
-    }
+    private fun connectGear(entry: GearEntry): Boolean = networkMgr.connect(entry)
+    private fun rebuildNetworks(oldId: Int) = networkMgr.rebuild(oldId)
+    private fun isBlockedByLargeGear(pos: AxlePos): Boolean = networkMgr.isBlockedByLargeGear(pos)
+    private fun networkEffectiveDpt(network: GearNetwork): Float = networkMgr.effectiveDpt(network)
+    private fun computeStepTicks(baseDpt: Float, network: GearNetwork): Int = networkMgr.stepTicks(baseDpt, network)
+    private fun mergeInto(primary: GearNetwork, secondary: GearNetwork, multCorrection: Float) = networkMgr.mergeInto(primary, secondary, multCorrection)
+    private fun assignToNetwork(entry: GearEntry, network: GearNetwork, mult: Float) = networkMgr.assignToNetwork(entry, network, mult)
+    private fun createNetwork(): GearNetwork = networkMgr.createNetwork()
+    private fun findNeighborConnections(pos: AxlePos, axis: dev.createonmc.axle.AxleAxis, gearType: GearType) = networkMgr.findNeighborConnections(pos, axis, gearType)
+    private fun perpendicularOffsets(axis: dev.createonmc.axle.AxleAxis) = networkMgr.perpendicularOffsets(axis)
 
     // ─── Persistence ─────────────────────────────────────────────────────────
 
@@ -1626,7 +1134,7 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
                 // esteira_fixed display — has belt_fixed_posa
                 val fixedTag = pdc.get(pdcBeltFixedPosA, PersistentDataType.STRING)
                 if (fixedTag != null) {
-                    parseAxlePos(fixedTag)?.let { posA ->
+                    AxlePos.parse(fixedTag)?.let { posA ->
                         fixedByPosA.getOrPut(posA) { mutableListOf() }.add(entity.uniqueId)
                     }
                     continue
@@ -1635,7 +1143,7 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
                 // Belt item display — has belt_item_posa + belt_item_stack2
                 val itemPosATag = pdc.get(pdcBeltItemPosA,  PersistentDataType.STRING)     ?: continue
                 val stackBytes  = pdc.get(pdcBeltItemStack, PersistentDataType.BYTE_ARRAY) ?: continue
-                val posA        = parseAxlePos(itemPosATag) ?: continue
+                val posA        = AxlePos.parse(itemPosATag) ?: continue
                 val item = runCatching { org.bukkit.inventory.ItemStack.deserializeBytes(stackBytes) }.getOrNull() ?: continue
                 itemsByPosA.getOrPut(posA) { mutableListOf() }
                     .add(ItemInfo(entity, item))
@@ -1707,60 +1215,6 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
             plugin.logger.info("Restored $beltCount belt(s) from loaded chunks.")
     }
 
-    private fun restoreFunelsFromWorld() {
-        var count = 0
-        for (world in plugin.server.worlds) {
-            for (entity in world.entities) {
-                if (entity !is ItemDisplay) continue
-                val pdc = entity.persistentDataContainer
-                val containerTag = pdc.get(pdcFunelContainerPos, PersistentDataType.STRING) ?: continue
-                val containerPos = parseAxlePos(containerTag) ?: continue
-                val stateStr = pdc.get(pdcFunelState, PersistentDataType.STRING) ?: continue
-                val state = runCatching { FunelState.valueOf(stateStr) }.getOrNull() ?: continue
-                if (funelsByUuid.containsKey(entity.uniqueId)) continue  // already restored
-
-                // Restore rotation from saved face
-                val faceName = pdc.get(pdcFunelFace, PersistentDataType.STRING)
-                val savedFace = faceName?.let { runCatching { org.bukkit.block.BlockFace.valueOf(it) }.getOrNull() }
-                    ?: continue  // face required to reconstruct FunelEntry
-                entity.transformation = org.bukkit.util.Transformation(
-                    entity.transformation.translation, RotationUtil.fromBlockFace(savedFace),
-                    entity.transformation.scale, IDENTITY_Q)
-
-                // Derive barrier pos from entity block coordinates (entity spawned at containerPos + face*0.501)
-                val barrierPos = AxlePos(world.name, entity.location.blockX, entity.location.blockY, entity.location.blockZ)
-
-                // Find the belt slot — search from barrier toward the direction it came from (container → barrier)
-                val faceModX = (barrierPos.bx - containerPos.bx).coerceIn(-1, 1)
-                val faceModY = (barrierPos.by - containerPos.by).coerceIn(-1, 1)
-                val faceModZ = (barrierPos.bz - containerPos.bz).coerceIn(-1, 1)
-                val searchPositions = listOf(
-                    AxlePos(world.name, barrierPos.bx + faceModX, barrierPos.by + faceModY,     barrierPos.bz + faceModZ),
-                    AxlePos(world.name, barrierPos.bx,            barrierPos.by + faceModY - 1, barrierPos.bz           ),
-                    AxlePos(world.name, barrierPos.bx + faceModX, barrierPos.by + faceModY - 1, barrierPos.bz + faceModZ),
-                    AxlePos(world.name, barrierPos.bx + faceModX, barrierPos.by + faceModY + 1, barrierPos.bz + faceModZ),
-                    barrierPos,
-                )
-                val (belt, slotIndex) = searchPositions.firstNotNullOfOrNull { beltBlockPos[it] } ?: continue
-                val beltSlotPos = belt.allPositions[slotIndex]
-
-                val posA = belt.allPositions.first()
-                val posB = belt.allPositions.last()
-                val stepX = when { posB.bx > posA.bx -> 1; posB.bx < posA.bx -> -1; else -> 0 }
-                val stepZ = when { posB.bz > posA.bz -> 1; posB.bz < posA.bz -> -1; else -> 0 }
-                val towardX = (containerPos.bx - beltSlotPos.bx).coerceIn(-1, 1)
-                val towardZ = (containerPos.bz - beltSlotPos.bz).coerceIn(-1, 1)
-
-                val entry = FunelEntry(entity.uniqueId, containerPos, beltSlotPos, slotIndex, state, savedFace)
-                funelsByUuid[entity.uniqueId] = entry
-                funelsByContainerPos[containerPos] = entity.uniqueId
-                addFunelInteractor(belt, slotIndex, containerPos, state, towardX, towardZ)
-                count++
-            }
-        }
-        if (count > 0) plugin.logger.info("Restored $count funel(s) from loaded chunks.")
-    }
-
     private fun restoreBelt(posA: AxlePos, posB: AxlePos, fixedUuids: List<UUID>): Boolean {
         val entryA = gearsByPos[posA] ?: return false
         val entryB = gearsByPos[posB] ?: return false
@@ -1807,12 +1261,6 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         return true
     }
 
-    private fun parseAxlePos(s: String): AxlePos? {
-        val p = s.split(",")
-        if (p.size < 4) return null
-        return runCatching { AxlePos(p[0], p[1].toInt(), p[2].toInt(), p[3].toInt()) }.getOrNull()
-    }
-
     /** Scans a newly loaded chunk (called by ChunkLoadEvent). */
     fun restoreFromChunk(chunk: org.bukkit.Chunk) {
         var count = 0
@@ -1834,7 +1282,7 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
                     else -> {
                         val tag = pdc.get(pdcBeltFixedPosA, PersistentDataType.STRING)
                             ?: pdc.get(pdcBeltItemPosA, PersistentDataType.STRING)
-                        tag?.let { parseAxlePos(it) }
+                        tag?.let { AxlePos.parse(it) }
                     }
                 }
                 if (posA != null && !beltsByAxle.containsKey(posA)) needsBeltRestore = true
@@ -1852,7 +1300,7 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         pendingBeltRestoreTaskId = plugin.server.scheduler.runTaskLater(plugin, Runnable {
             pendingBeltRestoreTaskId = -1
             restoreBeltsFromWorld()
-            restoreFunelsFromWorld()
+            funel.restoreFunels()
         }, 20L).taskId
     }
 
