@@ -54,6 +54,7 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
     /** Reverse lookup: every belt block pos → (belt, slotIndex). O(1) for BlockPlace/Break events. */
     internal val beltBlockPos = mutableMapOf<AxlePos, Pair<BeltEntry, Int>>()
     private val funelsByUuid = mutableMapOf<java.util.UUID, FunelEntry>()
+    private val funelsByContainerPos = mutableMapOf<AxlePos, java.util.UUID>()
     private var nextNetworkId = 0
     private var tickCount = 0
     private val beltDebug = false
@@ -474,8 +475,8 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
                     is BeltInteractor.FunelAuto -> interactor.containerPos
                     else -> null
                 } ?: continue
-                val funel = funelsByUuid.values.firstOrNull { it.containerPos == cPos } ?: continue
-                funelsByUuid.remove(funel.displayUuid)
+                val funelUuid = funelsByContainerPos.remove(cPos) ?: continue
+                val funel = funelsByUuid.remove(funelUuid) ?: continue
                 val entity = plugin.server.getEntity(funel.displayUuid)
                 if (entity != null) {
                     val barrierPos = AxlePos(entity.world.name, entity.location.blockX, entity.location.blockY, entity.location.blockZ)
@@ -576,7 +577,7 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
             e.itemDisplayTransform = org.bukkit.entity.ItemDisplay.ItemDisplayTransform.NONE
             e.interpolationDuration = 0
             e.transformation = org.bukkit.util.Transformation(
-                org.joml.Vector3f(), funelRotation(face),
+                org.joml.Vector3f(), RotationUtil.fromBlockFace(face),
                 org.joml.Vector3f(0.75f, 0.75f, 0.75f), IDENTITY_Q)
             e.setItemStack(funelDisplayItem(state))
         }
@@ -589,8 +590,9 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         val barrierBlock = world.getBlockAt(containerPos.bx + face.modX, containerPos.by + face.modY, containerPos.bz + face.modZ)
         if (barrierBlock.type.isAir) barrierBlock.type = Material.BARRIER
 
-        val entry = FunelEntry(display.uniqueId, containerPos, beltSlotPos, slotIndex, state)
+        val entry = FunelEntry(display.uniqueId, containerPos, beltSlotPos, slotIndex, state, face)
         funelsByUuid[display.uniqueId] = entry
+        funelsByContainerPos[containerPos] = display.uniqueId
         addFunelInteractor(belt, slotIndex, containerPos, state, towardX, towardZ)
         return true
     }
@@ -623,6 +625,7 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
     fun removeFunel(displayUuid: java.util.UUID) {
         val entry = funelsByUuid.remove(displayUuid)
         if (entry != null) {
+            funelsByContainerPos.remove(entry.containerPos)
             beltBlockPos[entry.beltSlotPos]?.let { (belt, slotIndex) ->
                 belt.interactors[slotIndex]?.removeIf { interactor ->
                     (interactor is BeltInteractor.FunelOut  && interactor.containerPos == entry.containerPos) ||
@@ -677,16 +680,6 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
             FunelState.ALIGNED -> BeltInteractor.FunelAuto(containerPos, towardX, towardZ)
         }
         belt.interactors.getOrPut(slotIndex) { mutableListOf() }.add(interactor)
-    }
-
-    private fun funelRotation(face: org.bukkit.block.BlockFace): Quaternionf = when (face) {
-        org.bukkit.block.BlockFace.SOUTH -> RotationUtil.axisAngle(0f, 1f, 0f,   0f)
-        org.bukkit.block.BlockFace.WEST  -> RotationUtil.axisAngle(0f, 1f, 0f,  90f)
-        org.bukkit.block.BlockFace.NORTH -> RotationUtil.axisAngle(0f, 1f, 0f, 180f)
-        org.bukkit.block.BlockFace.EAST  -> RotationUtil.axisAngle(0f, 1f, 0f, 270f)
-        org.bukkit.block.BlockFace.UP    -> RotationUtil.axisAngle(1f, 0f, 0f, -90f)
-        org.bukkit.block.BlockFace.DOWN  -> RotationUtil.axisAngle(1f, 0f, 0f,  90f)
-        else                             -> Quaternionf()
     }
 
     private fun funelDisplayItem(state: FunelState): org.bukkit.inventory.ItemStack {
@@ -1712,8 +1705,6 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
 
         if (beltCount > 0)
             plugin.logger.info("Restored $beltCount belt(s) from loaded chunks.")
-
-        restoreFunelsFromWorld()
     }
 
     private fun restoreFunelsFromWorld() {
@@ -1731,11 +1722,10 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
                 // Restore rotation from saved face
                 val faceName = pdc.get(pdcFunelFace, PersistentDataType.STRING)
                 val savedFace = faceName?.let { runCatching { org.bukkit.block.BlockFace.valueOf(it) }.getOrNull() }
-                if (savedFace != null) {
-                    entity.transformation = org.bukkit.util.Transformation(
-                        entity.transformation.translation, funelRotation(savedFace),
-                        entity.transformation.scale, IDENTITY_Q)
-                }
+                    ?: continue  // face required to reconstruct FunelEntry
+                entity.transformation = org.bukkit.util.Transformation(
+                    entity.transformation.translation, RotationUtil.fromBlockFace(savedFace),
+                    entity.transformation.scale, IDENTITY_Q)
 
                 // Derive barrier pos from entity block coordinates (entity spawned at containerPos + face*0.501)
                 val barrierPos = AxlePos(world.name, entity.location.blockX, entity.location.blockY, entity.location.blockZ)
@@ -1761,8 +1751,9 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
                 val towardX = (containerPos.bx - beltSlotPos.bx).coerceIn(-1, 1)
                 val towardZ = (containerPos.bz - beltSlotPos.bz).coerceIn(-1, 1)
 
-                val entry = FunelEntry(entity.uniqueId, containerPos, beltSlotPos, slotIndex, state)
+                val entry = FunelEntry(entity.uniqueId, containerPos, beltSlotPos, slotIndex, state, savedFace)
                 funelsByUuid[entity.uniqueId] = entry
+                funelsByContainerPos[containerPos] = entity.uniqueId
                 addFunelInteractor(belt, slotIndex, containerPos, state, towardX, towardZ)
                 count++
             }
@@ -1861,6 +1852,7 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         pendingBeltRestoreTaskId = plugin.server.scheduler.runTaskLater(plugin, Runnable {
             pendingBeltRestoreTaskId = -1
             restoreBeltsFromWorld()
+            restoreFunelsFromWorld()
         }, 20L).taskId
     }
 

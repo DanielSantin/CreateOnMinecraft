@@ -3,40 +3,48 @@ package dev.createonmc.gear
 import dev.createonmc.axle.AxlePos
 
 /**
- * Describes something attached to a specific belt slot that can push items
- * into the belt or pull items out of it.
+ * Describes an effect registered on a specific belt slot.
  *
- * Adding a new interactor type in the future:
- *   1. Add a subclass here (data class or object).
- *   2. Scan for it in GearManager.updateInteractorAt().
- *   3. Handle it in tickBeltInteractorsInsert() or tryExtractBeltItem() as appropriate.
+ * Two categories:
+ *  - Interactors: actively move items between the belt and an inventory (hoppers, funels).
+ *  - Modifiers:   passively alter item movement without transferring items (Obstacle).
+ *
+ * Adding a new interactor:
+ *   1. Add a subclass in the "Interactors" section below.
+ *   2. Scan for it in GearManager.updateInteractorAt() (for block-based) or
+ *      GearManager.placeFunel() (for entity-based).
+ *   3. Handle it in tickBeltInteractorsInsert() or tryExtractBeltItem().
  */
 sealed class BeltInteractor {
 
-    /** A hopper (or future inserter) that pushes items INTO the belt. */
+    // ── Interactors ───────────────────────────────────────────────────────────
+
+    /** Hopper (or future inserter) that pushes items INTO the belt. */
     data class HopperInsert(val hopperPos: AxlePos) : BeltInteractor()
 
-    /** A hopper (or future extractor) below the belt that pulls items OUT. */
+    /** Hopper (or future extractor) below the belt that pulls items OUT. */
     data class HopperExtract(val hopperPos: AxlePos) : BeltInteractor()
 
-    /** A solid non-barrier block directly above this slot that prevents items from passing through. */
-    object Obstacle : BeltInteractor()
-
-    /** Funel in OUT mode: pulls items from the container and puts them on the belt. */
+    /** Funel in OUT mode: container → belt. */
     data class FunelOut(val containerPos: AxlePos) : BeltInteractor()
 
-    /** Funel in IN mode: pulls items from the belt and puts them into the container. */
+    /** Funel in IN mode: belt → container. */
     data class FunelIn(val containerPos: AxlePos) : BeltInteractor()
 
     /**
-     * Funel in ALIGNED mode: the container is in the same direction as the belt flow.
-     * When belt moves toward the container → inserts belt items into the container.
-     * When belt moves away from the container → extracts from the container onto the belt.
-     * [alignedTowardX]/[alignedTowardZ]: unit vector from the belt slot toward the container.
+     * Funel in ALIGNED mode: container is in the belt travel direction.
+     * Belt moving toward container → belt → container (insert).
+     * Belt moving away from container → container → belt (extract).
+     * [alignedTowardX]/[alignedTowardZ]: unit vector from slot toward container.
      */
     data class FunelAuto(
         val containerPos: AxlePos,
         val alignedTowardX: Int,
         val alignedTowardZ: Int
     ) : BeltInteractor()
+
+    // ── Modifiers ─────────────────────────────────────────────────────────────
+
+    /** Solid non-barrier block above this slot — items cannot enter this slot. */
+    object Obstacle : BeltInteractor()
 }
