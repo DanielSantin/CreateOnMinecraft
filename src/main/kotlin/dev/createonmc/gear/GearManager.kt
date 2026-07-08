@@ -507,60 +507,39 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
      * Returns the signed DPT (degrees/tick) for a water wheel.
      * Sign encodes rotation direction; 0 = no net torque.
      *
-     * Uses the physical torque formula τ = r × F for each adjacent water block,
-     * projected onto the wheel axis:
-     *   X-axis: τ_x =  r_y · v_z   (dy encodes sign of r_y; top=+1, bottom=−1)
-     *   Z-axis: τ_z = −r_y · v_x   (same dy encoding, negated)
-     *   Y-axis: τ_y =  r_z·v_x − r_x·v_z  (both flow components matter)
+     * Uses the physical torque formula τ = (r × v)·axis for each perpendicular
+     * neighbor, where r is the unit offset to the neighbor and v is the actual
+     * fluid flow vector from Paper's FluidData.computeFlowDirection() — the same
+     * vector the vanilla engine uses to push entities. This handles falling
+     * water, corners and source/flow mixtures natively (the old level-gradient
+     * heuristic needed a special case for falling water) and, unlike levels,
+     * also measures the VERTICAL flow component, so water falling beside a
+     * wall-mounted wheel produces torque too.
      *
-     * flow level convention: level increases away from source (0=source, 7=far).
-     * vx ≈ level(E) − level(W); vz ≈ level(S) − level(N); positive = flows that way.
-     *
-     * Max per-block contribution: |dy|·7 = 7. Normalise by 7 → full RPM from one
-     * fully-flowing paddle. Opposite-side paddles in symmetric flow cancel (correct physics).
+     * Still pools / source blocks have flow ≈ 0 → no rotation: only a current
+     * drives the wheel. Opposite-side paddles in symmetric flow cancel
+     * (correct physics). |v| ≤ 1, so one fully-flowing paddle gives full RPM;
+     * clamp keeps multiple paddles from exceeding it.
      */
     private fun computeWaterWheelDpt(world: World, pos: AxlePos, axis: AxleAxis): Float {
         var score = 0f
         for ((dx, dy, dz) in perpendicularOffsets(axis)) {
             val wx = pos.bx + dx; val wy = pos.by + dy; val wz = pos.bz + dz
-            val block = world.getBlockAt(wx, wy, wz)
-            if (block.type != Material.WATER) continue
-            val lvl = (block.blockData as? org.bukkit.block.data.Levelled)?.level ?: continue
-            if (lvl == 0 || lvl >= 8) continue  // source or falling → no horizontal flow
+            // Never sample into an unloaded chunk — getFluidData would sync-load it
+            if (!world.isChunkLoaded(wx shr 4, wz shr 4)) continue
+            val loc = Location(world, wx.toDouble(), wy.toDouble(), wz.toDouble())
+            val fluid = world.getFluidData(loc)
+            val type = fluid.fluidType
+            if (type != org.bukkit.Fluid.WATER && type != org.bukkit.Fluid.FLOWING_WATER) continue
+            val v = fluid.computeFlowDirection(loc)
             score += when (axis) {
-                // τ_x = r_y · v_z ; dy is ±1 for top/bottom, 0 for N/S sides
-                AxleAxis.X -> dy * (wLvl(world, wx, wy, wz + 1) - wLvl(world, wx, wy, wz - 1)).toFloat()
-                // τ_z = −r_y · v_x ; same dy encoding, negated
-                AxleAxis.Z -> -dy * (wLvl(world, wx + 1, wy, wz) - wLvl(world, wx - 1, wy, wz)).toFloat()
-                // τ_y = r_z · v_x − r_x · v_z
-                AxleAxis.Y -> {
-                    val vx = (wLvl(world, wx + 1, wy, wz) - wLvl(world, wx - 1, wy, wz)).toFloat()
-                    val vz = (wLvl(world, wx, wy, wz + 1) - wLvl(world, wx, wy, wz - 1)).toFloat()
-                    dz * vx - dx * vz
-                }
+                AxleAxis.X -> (dy * v.z - dz * v.y).toFloat()   // (r × v)·x̂
+                AxleAxis.Y -> (dz * v.x - dx * v.z).toFloat()   // (r × v)·ŷ
+                AxleAxis.Z -> (dx * v.y - dy * v.x).toFloat()   // (r × v)·ẑ
             }
         }
-        // Normalise: max practical single-paddle contribution is 7 (one fully-flowing block).
-        // Clamp to [-1,1] in case multiple paddles add up, then scale to target RPM.
-        val normalized = (score / 7f).coerceIn(-1f, 1f)
+        val normalized = score.coerceIn(-1f, 1f)
         return normalized * WATER_WHEEL_RPM * 360f / (20f * 60f)
-    }
-
-    /**
-     * Water level at (x,y,z) for flow-gradient calculation.
-     *   non-water  → 8  (sentinel: "fully downstream / absent")
-     *   falling (8)→ 0  (falling water acts as a local source for horizontal spread)
-     *   source  (0)→ 0
-     *   flowing 1–7→ as-is
-     *
-     * Without this, a falling-water neighbor is indistinguishable from dry air,
-     * which inverts the gradient and reverses the detected flow direction.
-     */
-    private fun wLvl(world: World, x: Int, y: Int, z: Int): Int {
-        val b = world.getBlockAt(x, y, z)
-        if (b.type != Material.WATER) return 8
-        val lvl = (b.blockData as? org.bukkit.block.data.Levelled)?.level ?: 8
-        return if (lvl >= 8) 0 else lvl   // falling water (8) = local source = 0
     }
 
     // ─── Tick ────────────────────────────────────────────────────────────────
