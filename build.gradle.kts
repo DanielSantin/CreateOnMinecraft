@@ -30,10 +30,10 @@ configurations.named("compileClasspath") {
 
 // ── Localiza o servidor automaticamente (Linux ou Windows) ───────────────────
 val serverDir: File = run {
-    listOf("../CreateOnMC", "../CreateOnMinecraftServer")
+    listOf("../../ServerDev", "../CreateOnMC", "../CreateOnMinecraftServer")
         .map { file("${rootProject.projectDir}/$it") }
         .firstOrNull { it.exists() }
-        ?: file("${rootProject.projectDir}/../CreateOnMinecraftServer") // fallback
+        ?: file("${rootProject.projectDir}/../../ServerDev") // fallback
 }
 
 val isWindows = System.getProperty("os.name").lowercase().contains("windows")

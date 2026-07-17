@@ -5,10 +5,12 @@ import dev.createonmc.commands.SSGClearCommand
 import dev.createonmc.commands.SSGGiveCommand
 import dev.createonmc.commands.SSGItemCommand
 import dev.createonmc.gear.GearManager
+import dev.createonmc.gear.MillstoneRecipes
 import dev.createonmc.listeners.AxleInteractListener
 import dev.createonmc.listeners.BeltBlockListener
 import dev.createonmc.listeners.FunelInteractListener
 import dev.createonmc.listeners.GearChunkListener
+import dev.createonmc.listeners.GearRemoveListener
 import dev.createonmc.listeners.WaterDebugListener
 import org.bukkit.plugin.java.JavaPlugin
 
@@ -20,9 +22,11 @@ class CreateOnMinecraftPlugin : JavaPlugin() {
     val ssgItemCommand = SSGItemCommand()
 
     override fun onEnable() {
+        MillstoneRecipes.load(this)
         gearManager = GearManager(this)
         server.pluginManager.registerEvents(AxleInteractListener(gearManager, stressCommand, ssgItemCommand), this)
         server.pluginManager.registerEvents(GearChunkListener(gearManager), this)
+        server.pluginManager.registerEvents(GearRemoveListener(gearManager), this)
         server.pluginManager.registerEvents(BeltBlockListener(gearManager, this), this)
         server.pluginManager.registerEvents(FunelInteractListener(gearManager, this), this)
         server.pluginManager.registerEvents(WaterDebugListener(logger), this)

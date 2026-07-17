@@ -787,7 +787,7 @@ class BeltManager(
     fun beltSpinItem(): ItemStack {
         val stack = ItemStack(Material.STICK)
         val meta  = stack.itemMeta ?: return stack
-        meta.setItemModel(NamespacedKey("ssggearmachine", "states/esteira_spin"))
+        meta.setItemModel(NamespacedKey("ssggearmachine", "parts/esteira_spin"))
         stack.itemMeta = meta
         return stack
     }
@@ -795,7 +795,7 @@ class BeltManager(
     fun beltFixedItem(): ItemStack {
         val stack = ItemStack(Material.STICK)
         val meta  = stack.itemMeta ?: return stack
-        meta.setItemModel(NamespacedKey("ssggearmachine", "states/esteira_fixed"))
+        meta.setItemModel(NamespacedKey("ssggearmachine", "parts/esteira_fixed"))
         stack.itemMeta = meta
         return stack
     }

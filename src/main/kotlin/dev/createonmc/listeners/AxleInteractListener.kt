@@ -208,7 +208,7 @@ class AxleInteractListener(
                 if (original.amount <= 0) player.inventory.setItemInMainHand(org.bukkit.inventory.ItemStack(Material.AIR))
                 val recipe = ms.currentRecipe
                 val msg = if (recipe != null)
-                    "§7[Millstone] Input: §f${ms.inputCount}x ${ms.inputItem?.name} §7→ §f${recipe.output.name}"
+                    "§7[Millstone] Input: §f${ms.inputCount}x ${ms.inputItem?.name} §7→ §f${recipe.primary.item.name}"
                 else "§c[Millstone] No recipe for ${held.type.name}."
                 player.sendMessage(msg)
             } else {

@@ -544,32 +544,42 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
 
     // ─── Tick ────────────────────────────────────────────────────────────────
 
+    /**
+     * Called from GearRemoveListener when a gear's ItemDisplay is removed from the
+     * world for any cause except chunk unload (/kill, explosion, another plugin…).
+     * Cleans up the in-memory state but keeps PDC so the gear/belt can be restored
+     * if the entity ever comes back via chunk reload.
+     */
+    internal fun onDisplayRemoved(display: ItemDisplay) {
+        val pdc = display.persistentDataContainer
+        if (!pdc.has(pdcGearType, PersistentDataType.STRING)) return
+        val worldName = pdc.get(pdcWorldName, PersistentDataType.STRING) ?: return
+        val bx = pdc.get(pdcBX, PersistentDataType.INTEGER) ?: return
+        val by = pdc.get(pdcBY, PersistentDataType.INTEGER) ?: return
+        val bz = pdc.get(pdcBZ, PersistentDataType.INTEGER) ?: return
+        val pos = AxlePos(worldName, bx, by, bz)
+        val entry = gearsByPos[pos] ?: return
+        // Belt/extra displays carry the same PDC; only the tracked main display counts.
+        if (entry.displayUuid != display.uniqueId) return
+
+        detachBelt(pos, clearPersistence = false)
+        gearsByPos.remove(pos)
+        entry.extraDisplayUuids.forEach { plugin.server.getEntity(it)?.remove() }
+        millstoneData.remove(pos)
+        plugin.server.getWorld(pos.worldName)?.let { w ->
+            removeColliders(w, pos.bx, pos.by, pos.bz, entry.gearType)
+        }
+        networks[entry.networkId]?.let { net ->
+            net.members.remove(pos); net.motorPositions.remove(pos)
+            if (net.members.isEmpty()) networks.remove(entry.networkId)
+        }
+    }
+
     private fun tick() {
         tickCount++
         if (tickCount % 20 == 0) updateWaterWheelSpeeds()
         tickMillstones()
         tickBelts()
-
-        val dead = mutableListOf<AxlePos>()
-        for ((_, entry) in gearsByPos) {
-            val display = entry.cachedDisplay
-            // isDead() = entity actually removed; !isValid() would also fire on chunk unload,
-            // causing a restore loop when the chunk reloads.
-            if (display == null || display.isDead()) dead.add(entry.pos)
-        }
-        dead.forEach { pos ->
-            detachBelt(pos, clearPersistence = false)  // clean up in-memory state; keep PDC so belt can be restored on reload
-            val e = gearsByPos.remove(pos) ?: return@forEach
-            e.extraDisplayUuids.forEach { plugin.server.getEntity(it)?.remove() }
-            millstoneData.remove(pos)
-            plugin.server.getWorld(pos.worldName)?.let { w ->
-                removeColliders(w, pos.bx, pos.by, pos.bz, e.gearType)
-            }
-            networks[e.networkId]?.let { net ->
-                net.members.remove(pos); net.motorPositions.remove(pos)
-                if (net.members.isEmpty()) networks.remove(e.networkId)
-            }
-        }
 
         for ((_, net) in networks) {
             if (net.motorPositions.isEmpty()) continue
@@ -629,7 +639,7 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
             // ── Processing (requires network power) ──────────────────────────
             val recipe = ms.currentRecipe ?: continue
             if (ms.inputCount <= 0) continue
-            if (ms.outputItems.sumOf { it.amount } >= MillstoneData.MAX_OUTPUT_STACKS * recipe.output.maxStackSize) continue
+            if (ms.outputItems.sumOf { it.amount } >= MillstoneData.MAX_OUTPUT_STACKS * recipe.primary.item.maxStackSize) continue
 
             val network = networks[entry.networkId] ?: continue
             val baseDpt = networkEffectiveDpt(network)
@@ -661,9 +671,11 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
                     ms.currentRecipe = null
                     ms.progressTicks = 0
                 }
-                val output = ms.outputItems.find { it.type == recipe.output && it.amount < it.maxStackSize }
-                if (output != null) output.amount += recipe.outputCount
-                else ms.outputItems.add(org.bukkit.inventory.ItemStack(recipe.output, recipe.outputCount))
+                for (result in recipe.rollResults()) {
+                    val output = ms.outputItems.find { it.type == result.item && it.amount < it.maxStackSize }
+                    if (output != null) output.amount += result.count
+                    else ms.outputItems.add(org.bukkit.inventory.ItemStack(result.item, result.count))
+                }
                 entry.cachedDisplay?.let { tagMillstoneState(it, ms) }
             }
         }
