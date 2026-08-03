@@ -580,10 +580,27 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
 
     private fun tick() {
         tickCount++
-        if (tickCount % 20 == 0) updateWaterWheelSpeeds()
-        tickMillstones()
-        tickBelts()
+        if (tickCount % 20 == 0) runIsolated("updateWaterWheelSpeeds") { updateWaterWheelSpeeds() }
+        runIsolated("tickMillstones") { tickMillstones() }
+        runIsolated("tickBelts") { tickBelts() }
+        runIsolated("networks") { tickNetworks() }
+    }
 
+    /**
+     * Runs one tick sub-system in isolation. `runTaskTimer`'s Runnable has no outer try/catch —
+     * an uncaught exception anywhere in [tick] would otherwise permanently cancel the whole
+     * per-tick task (silently stopping gears, millstones AND belts server-wide until restart).
+     * Catching per sub-system keeps e.g. a broken belt from also freezing motors/millstones.
+     */
+    private inline fun runIsolated(name: String, block: () -> Unit) {
+        try {
+            block()
+        } catch (e: Exception) {
+            plugin.logger.warning("[GearManager] $name tick failed: ${e}")
+        }
+    }
+
+    private fun tickNetworks() {
         for ((_, net) in networks) {
             if (net.motorPositions.isEmpty()) continue
             if (--net.ticksLeft > 0) continue

@@ -1,4 +1,4 @@
-name: CreateOnMinecraft
+name: SSGCreateOnMinecraft
 version: 1.0.0
 main: dev.createonmc.CreateOnMinecraftPlugin
 api-version: "26.1.2"
