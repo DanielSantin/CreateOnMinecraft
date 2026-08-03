@@ -27,13 +27,13 @@ class SSGGiveCommand : CommandExecutor, TabCompleter {
         }
 
         val stack = when (type) {
-            "gear"        -> makeItem(NexoIds.COGWHEEL, "Cogwheel")
-            "biggear"     -> makeItem(NexoIds.LARGE_COGWHEEL, "Large Cogwheel")
-            "eixo"        -> makeItem(NexoIds.AXLE, "Axle")
-            "water_wheel" -> makeItem(NexoIds.WATER_WHEEL, "Water Wheel")
-            "millstone"   -> makeItem(NexoIds.MILLSTONE, "Millstone")
+            "gear"        -> makeItem(NexoIds.COGWHEEL, "Engrenagem")
+            "biggear"     -> makeItem(NexoIds.LARGE_COGWHEEL, "Engrenagem Grande")
+            "eixo"        -> makeItem(NexoIds.AXLE, "Eixo")
+            "water_wheel" -> makeItem(NexoIds.WATER_WHEEL, "Roda D'Água")
+            "millstone"   -> makeItem(NexoIds.MILLSTONE, "Moinho")
             "esteira"     -> makeItem(NexoIds.ESTEIRA, "Esteira")
-            "funel"       -> makeItem(NexoIds.FUNEL, "Funel")
+            "funel"       -> makeItem(NexoIds.FUNEL, "Funil")
             "motor" -> {
                 val rpm = args.getOrNull(1)?.toFloatOrNull() ?: 10f
                 if (rpm == 0f) { sender.sendMessage("RPM cannot be 0."); return true }

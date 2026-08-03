@@ -29,19 +29,19 @@
 
 # ── Held items (given via /ssggive, placed by right-click) ──────────────────
 gear:
-  itemname: "<white>Cogwheel"
+  itemname: "<white>Engrenagem"
   material: STICK
   Components:
     item_model: ssggearmachine:gear
 
 biggear:
-  itemname: "<white>Large Cogwheel"
+  itemname: "<white>Engrenagem Grande"
   material: STICK
   Components:
     item_model: ssggearmachine:biggear
 
 eixo:
-  itemname: "<white>Axle"
+  itemname: "<white>Eixo"
   material: STICK
   Components:
     item_model: ssggearmachine:eixo
@@ -53,13 +53,13 @@ motor:
     item_model: ssggearmachine:motor
 
 water_wheel:
-  itemname: "<white>Water Wheel"
+  itemname: "<white>Roda D'Água"
   material: STICK
   Components:
     item_model: ssggearmachine:water_wheel
 
 millstone:
-  itemname: "<white>Millstone"
+  itemname: "<white>Moinho"
   material: STICK
   Components:
     item_model: ssggearmachine:millstone
@@ -71,7 +71,7 @@ esteira:
     item_model: ssggearmachine:esteira
 
 funel:
-  itemname: "<white>Funel"
+  itemname: "<white>Funil"
   material: STICK
   Components:
     item_model: ssggearmachine:funel

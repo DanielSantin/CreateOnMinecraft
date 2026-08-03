@@ -10,6 +10,7 @@ import dev.createonmc.gear.GearType
 import dev.createonmc.nexo.NexoCompat
 import dev.createonmc.nexo.NexoIds
 import dev.createonmc.util.AxleUtil
+import dev.createonmc.util.ItemUtil
 import org.bukkit.Location
 import org.bukkit.Material
 import org.bukkit.NamespacedKey
@@ -170,6 +171,7 @@ class AxleInteractListener(
             if (gearManager.spawnGear(player.world, x + dx * i, y + dy * i, z + dz * i,
                     orientQ, axis, gearType = gearType, isMotor = isMotor, rpm = rpm)) placed++
         }
+        if (placed > 0) ItemUtil.consumeHeld(player, placed)
         if (count > 1) player.sendMessage("§7[GearStress] Colocadas §f$placed/$count §7gears.")
     }
 
@@ -195,6 +197,7 @@ class AxleInteractListener(
 
         beltSelections.remove(player.uniqueId)
         if (gearManager.attachBelt(selA, pos)) {
+            ItemUtil.consumeHeld(player)
             player.sendMessage("§a[Esteira] Conectada!")
         } else {
             player.sendMessage("§c[Esteira] Falhou. Os eixos devem ser paralelos, mesmo eixo rotacional, mesma altura, e a direção da cinta deve ser perpendicular ao eixo.")

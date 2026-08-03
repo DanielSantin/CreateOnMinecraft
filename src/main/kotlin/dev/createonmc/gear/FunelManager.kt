@@ -249,7 +249,7 @@ class FunelManager(
     fun giveItem(): ItemStack {
         val stack = NexoCompat.item(NexoIds.FUNEL)
         val meta = stack.itemMeta ?: return stack
-        meta.setDisplayName("§rFunel")
+        meta.setDisplayName("§rFunil")
         stack.itemMeta = meta
         return stack
     }

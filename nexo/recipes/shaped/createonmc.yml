@@ -1,0 +1,130 @@
+# Shaped crafting recipes for CreateOnMinecraft, registered directly in Nexo.
+#
+# WHERE THIS GOES: copy this file to plugins/Nexo/recipes/shaped/createonmc.yml on the
+# server, then /nexo reload (or restart) so Nexo picks it up. These are plain crafting-
+# table recipes — nothing here touches the plugin's own placement code, they only make
+# the existing Nexo items (nexo/items/createonmc.yml) obtainable in survival.
+#
+# DESIGN: each recipe is adapted from the real Create mod's crafting recipe for the
+# equivalent part, but flattened to vanilla-only ingredients (no fabricated "Andesite
+# Alloy" intermediate item) — every ingredient here is either a vanilla `minecraft_type`
+# or one of our own already-existing Create pieces (`nexo_item`) used exactly where the
+# real Create recipe consumes the equivalent prior-tier part (e.g. Water Wheel needs a
+# Shaft, Millstone needs a Cogwheel):
+#
+#   - gear (Cogwheel):       real recipe = 1 Andesite Alloy + 8 Wood Buttons -> 8
+#   - biggear (Large Cogwheel): real recipe = 1 Andesite Alloy + 4 Planks + 4 Buttons -> 2
+#   - eixo (Shaft):          real recipe = 2 Andesite Alloy -> 8
+#   - water_wheel:           real recipe = 8 Planks + 1 Shaft -> 1 (uses our own eixo)
+#   - millstone:             real recipe = 2 Andesite Alloy + 1 Cogwheel + 1 Plank + 1 Stone -> 1
+#   - funel:                 real recipe = 2 Andesite Alloy + 2 Dried Kelp -> 2
+#
+# Wherever the real recipe called for Andesite Alloy, it's substituted 1:1 with plain
+# vanilla ANDESITE (the alloy's own base ingredient in the real mod).
+#
+# `motor` is deliberately NOT in this file — it corresponds to Create's Creative Motor,
+# which is creative-only and has no recipe at all in the real mod. It stays give/admin-only.
+#
+# `esteira` DOES have a recipe below, even though real Create's Belt has none (it's
+# placed by right-clicking two Shafts, never crafted) — in this plugin `esteira` is the
+# actual held/consumed item used to connect two `eixo`s, which is a different mechanic
+# from vanilla Create, so it needs to be obtainable like any other piece.
+
+gear:
+  result:
+    nexo_item: gear
+    amount: 8
+  ingredients:
+    A:
+      minecraft_type: ANDESITE
+    B:
+      minecraft_type: OAK_BUTTON
+  shape:
+  - BBB
+  - BAB
+  - BBB
+
+biggear:
+  result:
+    nexo_item: biggear
+    amount: 2
+  ingredients:
+    A:
+      minecraft_type: ANDESITE
+    P:
+      minecraft_type: OAK_PLANKS
+    B:
+      minecraft_type: OAK_BUTTON
+  shape:
+  - BPB
+  - PAP
+  - BPB
+
+eixo:
+  result:
+    nexo_item: eixo
+    amount: 8
+  ingredients:
+    A:
+      minecraft_type: ANDESITE
+  shape:
+  - _A_
+  - _A_
+  - ___
+
+water_wheel:
+  result:
+    nexo_item: water_wheel
+  ingredients:
+    P:
+      minecraft_type: OAK_PLANKS
+    S:
+      nexo_item: eixo
+  shape:
+  - PPP
+  - PSP
+  - PPP
+
+millstone:
+  result:
+    nexo_item: millstone
+  ingredients:
+    A:
+      minecraft_type: ANDESITE
+    G:
+      nexo_item: gear
+    P:
+      minecraft_type: OAK_PLANKS
+    T:
+      minecraft_type: STONE
+  shape:
+  - _T_
+  - AGA
+  - _P_
+
+funel:
+  result:
+    nexo_item: funel
+    amount: 2
+  ingredients:
+    A:
+      minecraft_type: ANDESITE
+    K:
+      minecraft_type: DRIED_KELP
+  shape:
+  - _K_
+  - AKA
+  - ___
+
+esteira:
+  result:
+    nexo_item: esteira
+  ingredients:
+    L:
+      minecraft_type: LEATHER
+    S:
+      nexo_item: eixo
+  shape:
+  - LLL
+  - LSL
+  - LLL

@@ -4,6 +4,7 @@ import dev.createonmc.axle.AxlePos
 import dev.createonmc.gear.GearManager
 import dev.createonmc.nexo.NexoCompat
 import dev.createonmc.nexo.NexoIds
+import dev.createonmc.util.ItemUtil
 import org.bukkit.Location
 import org.bukkit.Material
 import org.bukkit.entity.ItemDisplay
@@ -33,7 +34,9 @@ class FunelInteractListener(private val gearManager: GearManager, private val pl
             if (debounce(player.uniqueId)) return
             event.isCancelled = true
             val containerPos = AxlePos(block.world.name, block.x, block.y, block.z)
-            if (!gearManager.placeFunel(block.world, containerPos, event.blockFace))
+            if (gearManager.placeFunel(block.world, containerPos, event.blockFace))
+                ItemUtil.consumeHeld(player)
+            else
                 player.sendMessage("§cNenhuma esteira encontrada adjacente ao contêiner.")
             return
         }

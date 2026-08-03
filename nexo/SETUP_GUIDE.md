@@ -53,8 +53,8 @@ etc.) **não usam texturas customizadas** — são modelos Blockbench que reapro
 texturas vanilla (ex: `block/blast_furnace_top`, `block/stripped_spruce_log`). Ou seja:
 não tem PNG pra copiar, só os JSONs de modelo.
 
-Fonte desses assets (ajuste o caminho pro que for válido no ambiente de vocês):
-`/home/ubuntu/pluginDev/reference/texture/assets/ssggearmachine/`
+Fonte desses assets :
+`/home/ubuntu/pluginDEV/references/SSGGearMachine`
 (também tem um backup em `SSGGearMachine.rar` na raiz do `pluginDev`).
 
 Estrutura relevante dentro dessa pasta:
@@ -93,6 +93,26 @@ pro namespace/caminho certo (`ssggearmachine:...`), não importa quem "hospeda" 
   certo, e o clique direito pra colocar deve continuar funcionando normalmente.
   Se o item vier como um stick sem modelo nenhum, é o fallback do `NexoCompat` — sinal
   de que o ID não bateu (voltar pro passo 2/4).
+
+### 5. Receitas de crafting (opcional, mas já prontas)
+
+`nexo/recipes/shaped/createonmc.yml` (neste repositório) tem receitas de crafting-table
+pra 7 dos 8 itens "empunháveis" (`gear`, `biggear`, `eixo`, `water_wheel`, `millstone`,
+`funel`, `esteira`), baseadas nas receitas reais do mod Create, mas achatadas pra usar só
+ingredientes vanilla (sem inventar um item intermediário tipo "Andesite Alloy" — onde a
+receita real do Create pedia Andesite Alloy, aqui entra ANDESITE puro).
+
+Só `motor` **não tem receita de propósito** — no Create real, ele corresponde ao
+Creative Motor, que é criativo-only e não tem receita nenhuma. Continua só via
+`/ssggive` (admin).
+
+`esteira` tem receita mesmo o Belt real do Create não tendo nenhuma (lá ele é criado
+clicando com o botão direito em dois Shafts, nunca craftado) — nesse plugin `esteira` é
+o item que de fato conecta dois `eixo`s, um mecanismo diferente do mod original, então
+precisa ser obtido de algum jeito em sobrevivência.
+
+- Copie `nexo/recipes/shaped/createonmc.yml` → `plugins/Nexo/recipes/shaped/createonmc.yml`.
+- `/nexo reload` (ou restart) pra aplicar junto com o passo 2.
 
 ## Referências
 

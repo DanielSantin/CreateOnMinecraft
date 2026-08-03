@@ -51,12 +51,12 @@ object NexoIds {
 
     /** Chat-facing label, since we no longer hardcode display names on the ItemStack. */
     fun labelFor(type: GearType): String = when (type) {
-        GearType.COGWHEEL -> "Cogwheel"
-        GearType.LARGE_COGWHEEL -> "Large Cogwheel"
-        GearType.AXLE -> "Axle"
+        GearType.COGWHEEL -> "Engrenagem"
+        GearType.LARGE_COGWHEEL -> "Engrenagem Grande"
+        GearType.AXLE -> "Eixo"
         GearType.MOTOR -> "Motor"
-        GearType.WATER_WHEEL -> "Water Wheel"
-        GearType.MILLSTONE -> "Millstone"
+        GearType.WATER_WHEEL -> "Roda D'Água"
+        GearType.MILLSTONE -> "Moinho"
     }
 
     fun gearTypeFromId(id: String?): GearType? = when (id) {

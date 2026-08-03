@@ -1,5 +1,5 @@
 name: CreateOnMinecraft
-version: 1.0-SNAPSHOT
+version: 1.0.0
 main: dev.createonmc.CreateOnMinecraftPlugin
 api-version: "26.1.2"
 description: Recreating the Create mod as a Paper plugin
