@@ -17,6 +17,10 @@ class FunelManager(
     private val plugin: CreateOnMinecraftPlugin,
     private val beltBlockPos: MutableMap<AxlePos, Pair<BeltEntry, Int>>
 ) {
+    companion object {
+        private const val FUNEL_SCALE = 1f
+    }
+
     private val funelsByUuid         = mutableMapOf<UUID, FunelEntry>()
     private val funelsByContainerPos = mutableMapOf<AxlePos, UUID>()
 
@@ -47,16 +51,21 @@ class FunelManager(
 
         val state = if (isAligned) FunelState.ALIGNED else FunelState.OUT
 
-        val loc = org.bukkit.Location(world,
-            containerPos.bx + 0.5 + face.modX * 0.501,
-            containerPos.by + 0.5 + face.modY * 0.501,
-            containerPos.bz + 0.5 + face.modZ * 0.501)
+        val barrierBlock = world.getBlockAt(containerPos.bx + face.modX, containerPos.by + face.modY, containerPos.bz + face.modZ)
+        if (barrierBlock.type.isAir) barrierBlock.type = Material.BARRIER
+
+        // ItemDisplay entities pivot block-style models around their geometric center by default (unlike
+        // a real placed block, which is corner-anchored), so the entity must spawn at the barrier block's
+        // center - not the container's. The old `+ face * 0.501` only advanced half a block past the
+        // container's own center, leaving the funel recessed toward the container instead of centered in
+        // the barrier.
+        val loc = org.bukkit.Location(world, barrierBlock.x + 0.5, barrierBlock.y + 0.5, barrierBlock.z + 0.5)
         val display = world.spawn(loc, ItemDisplay::class.java) { e ->
             e.itemDisplayTransform = ItemDisplay.ItemDisplayTransform.NONE
             e.interpolationDuration = 0
             e.transformation = org.bukkit.util.Transformation(
                 org.joml.Vector3f(), RotationUtil.fromBlockFace(face),
-                org.joml.Vector3f(0.75f, 0.75f, 0.75f), Quaternionf())
+                org.joml.Vector3f(FUNEL_SCALE, FUNEL_SCALE, FUNEL_SCALE), Quaternionf())
             e.setItemStack(displayItem(state))
         }
         val posTag = "${containerPos.worldName},${containerPos.bx},${containerPos.by},${containerPos.bz}"
@@ -64,14 +73,25 @@ class FunelManager(
         display.persistentDataContainer.set(pdcState, PersistentDataType.STRING, state.name)
         display.persistentDataContainer.set(pdcFace, PersistentDataType.STRING, face.name)
 
-        val barrierBlock = world.getBlockAt(containerPos.bx + face.modX, containerPos.by + face.modY, containerPos.bz + face.modZ)
-        if (barrierBlock.type.isAir) barrierBlock.type = Material.BARRIER
-
         val entry = FunelEntry(display.uniqueId, containerPos, beltSlotPos, slotIndex, state, face)
         funelsByUuid[display.uniqueId] = entry
         funelsByContainerPos[containerPos] = display.uniqueId
         addFunelInteractor(belt, slotIndex, containerPos, state, towardX, towardZ)
         return true
+    }
+
+    /**
+     * Called by [BeltManager] every 8 ticks for each ALIGNED funel to keep its displayed icon
+     * (funel_in/funel_out) matching which way it's currently transferring items. No-op for
+     * fixed OUT/IN funels and skipped entirely if the direction hasn't changed since last call.
+     */
+    fun setAutoDirection(containerPos: AxlePos, showingIn: Boolean) {
+        val uuid = funelsByContainerPos[containerPos] ?: return
+        val entry = funelsByUuid[uuid] ?: return
+        if (entry.state != FunelState.ALIGNED || entry.autoShowingIn == showingIn) return
+        entry.autoShowingIn = showingIn
+        val display = (plugin.server.getEntity(uuid) as? ItemDisplay) ?: return
+        display.setItemStack(displayItem(if (showingIn) FunelState.IN else FunelState.OUT))
     }
 
     /** Toggles the funel between OUT and IN. Does nothing if state is ALIGNED. */
@@ -132,7 +152,7 @@ class FunelManager(
             containerPos.by + face.modY,
             containerPos.bz + face.modZ))
 
-    /** Searches for a funel entity at [barrierPos]. The funel entity spawns at containerPos + face*0.501,
+    /** Searches for a funel entity at [barrierPos]. The funel entity spawns at the barrier block's center,
      *  so a radius of 0.6 is sufficient. */
     fun findFunelAtBarrier(barrierPos: AxlePos): UUID? {
         val world = plugin.server.getWorld(barrierPos.worldName) ?: return null

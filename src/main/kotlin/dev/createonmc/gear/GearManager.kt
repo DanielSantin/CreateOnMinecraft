@@ -48,7 +48,8 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
     val belt = BeltManager(plugin, gearsByPos, networkMgr, beltsByAxle, beltBlockPos,
         onDropFunelsForBelt = { b -> funel.dropFunelsForBelt(b) },
         onGearItem          = { t -> gearItem(t) },
-        onTagDisplay        = { d, e -> tagDisplay(d, e) })
+        onTagDisplay        = { d, e -> tagDisplay(d, e) },
+        onFunelAutoDirection = { pos, showingIn -> funel.setAutoDirection(pos, showingIn) })
     private var tickCount = 0
     // Belt restoration is debounced: fires 20 ticks after the last chunk load so all
     // adjacent chunks (and their gear entities) are ready before we try to re-attach.

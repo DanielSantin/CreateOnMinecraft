@@ -12,5 +12,7 @@ class FunelEntry(
     val beltSlotPos: AxlePos,
     val slotIndex: Int,
     var state: FunelState,
-    val face: BlockFace
+    val face: BlockFace,
+    /** Last direction shown for an ALIGNED funel (true = funel_in). Ignored for OUT/IN states. */
+    var autoShowingIn: Boolean = false
 )

@@ -50,7 +50,7 @@ tasks {
 
     register("deploy") {
         group = "minecraft"
-        description = "Compila o plugin, copia para o servidor e o reinicia."
+        description = "Compila o plugin, copia para o servidor e o reinicia (via screen no Linux)."
         dependsOn(shadowJar)
         doLast {
             println("📦 JAR copiado para: ${serverDir.absolutePath}/plugins")
@@ -67,29 +67,38 @@ tasks {
                     .start()
 
             } else {
-                // ── Linux ────────────────────────────────────────────────
-                val pidFile = File(serverDir, "server.pid")
+                // ── Linux: gerencia o servidor dentro de uma screen "server" ──
+                val screenName = "server"
 
-                if (pidFile.exists()) {
-                    val pid = pidFile.readText().trim()
-                    println("🛑 Parando servidor (PID $pid)...")
-                    exec {
-                        commandLine("bash", "-c", "kill $pid 2>/dev/null || true")
-                        isIgnoreExitValue = true
-                    }
-                    pidFile.delete()
-                    Thread.sleep(3000) // aguarda o processo encerrar
-                } else {
-                    println("ℹ️  server.pid não encontrado — subindo servidor pela primeira vez.")
+                fun screenExists(): Boolean {
+                    val proc = ProcessBuilder("screen", "-list").redirectErrorStream(true).start()
+                    val output = proc.inputStream.bufferedReader().readText()
+                    proc.waitFor()
+                    return Regex("""\.${Regex.escape(screenName)}\s""").containsMatchIn(output)
                 }
 
-                // Inicia em background; start.sh grava o PID em server.pid
-                ProcessBuilder("bash", "start.sh")
+                if (screenExists()) {
+                    println("🛑 Servidor rodando na screen '$screenName' — enviando 'stop' pelo console...")
+                    ProcessBuilder("screen", "-S", screenName, "-X", "stuff", "stop\n").start().waitFor()
+
+                    var waited = 0
+                    while (screenExists() && waited < 60) {
+                        Thread.sleep(1000)
+                        waited++
+                    }
+                    if (screenExists()) {
+                        println("⚠️  Servidor não encerrou a tempo (60s) — a screen '$screenName' ainda existe.")
+                    }
+                }
+
+                println("🚀 Iniciando servidor na screen '$screenName'...")
+                ProcessBuilder("screen", "-dmS", screenName, "bash", "start.sh")
                     .directory(serverDir)
                     .start()
+                    .waitFor()
             }
 
-            println("✅ Servidor reiniciando...")
+            println("✅ Deploy concluído.")
         }
     }
 }

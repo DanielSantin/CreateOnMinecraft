@@ -20,7 +20,8 @@ import java.util.UUID
  * Owns belt state and all belt transport logic.
  *
  * [beltBlockPos] is a shared map also held by [FunelManager] — mutations here are visible there.
- * [onDropFunelsForBelt] is a callback into [FunelManager] to avoid circular construction order.
+ * [onDropFunelsForBelt] and [onFunelAutoDirection] are callbacks into [FunelManager] to avoid
+ * circular construction order.
  * [onGearItem]/[onTagDisplay] delegate display-related helpers that live in [GearManager].
  */
 class BeltManager(
@@ -31,7 +32,8 @@ class BeltManager(
     val beltBlockPos: MutableMap<AxlePos, Pair<BeltEntry, Int>>,
     private val onDropFunelsForBelt: (BeltEntry) -> Unit,
     private val onGearItem: (GearType) -> ItemStack,
-    private val onTagDisplay: (ItemDisplay, GearEntry) -> Unit
+    private val onTagDisplay: (ItemDisplay, GearEntry) -> Unit,
+    private val onFunelAutoDirection: (AxlePos, Boolean) -> Unit
 ) {
     private val beltDebug = false
 
@@ -343,7 +345,10 @@ class BeltManager(
         val forward     = signedSpeed > 0f
 
         if (tickCount % 4 == 0) pickupItemEntities(world, belt, posA, stepX, stepZ)
-        if (tickCount % 8 == 0) tickBeltInteractorsInsert(world, belt, posA, stepX, stepZ, forward)
+        if (tickCount % 8 == 0) {
+            tickBeltInteractorsInsert(world, belt, posA, stepX, stepZ, forward)
+            syncFunelAutoDisplays(belt, stepX, stepZ, forward)
+        }
 
         if (signedSpeed == 0f || belt.items.isEmpty()) return
 
@@ -509,6 +514,23 @@ class BeltManager(
             val spawned = spawnBeltItem(world, posA, stepX, stepZ, itemStack, slotPos)
             if (beltDebug) plugin.logger.info("[BeltDBG] $beltTag spawned BeltItem=${spawned.displayUuid.toString().takeLast(6)} beltPos=$slotPos")
             belt.items.add(spawned)
+        }
+    }
+
+    /**
+     * Keeps each ALIGNED funel's displayed icon (funel_in/funel_out) matching the direction it is
+     * currently acting in. Unlike fixed funels, an auto funel's role flips at runtime whenever the
+     * belt reverses (mechanical drives aren't one-directional), so this can't be decided once at
+     * placement time — it must be re-evaluated on the same cadence as the actual item transfer logic.
+     */
+    private fun syncFunelAutoDisplays(belt: BeltEntry, stepX: Int, stepZ: Int, forward: Boolean) {
+        for ((_, interactors) in belt.interactors) {
+            for (interactor in interactors) {
+                if (interactor !is BeltInteractor.FunelAuto) continue
+                val travelingToward = (forward && interactor.alignedTowardX == stepX && interactor.alignedTowardZ == stepZ) ||
+                    (!forward && interactor.alignedTowardX == -stepX && interactor.alignedTowardZ == -stepZ)
+                onFunelAutoDirection(interactor.containerPos, travelingToward)
+            }
         }
     }
 

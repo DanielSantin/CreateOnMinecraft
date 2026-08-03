@@ -100,6 +100,10 @@ class AxleInteractListener(
 
         if (player.inventory.itemInMainHand.type != Material.STICK) return
 
+        // Blocos interativos (baú, alavanca, porta…): a ação vanilla vence a
+        // colocação, a menos que o jogador esteja agachado — mesma regra do jogo.
+        if (!player.isSneaking && isInteractive(block)) return
+
         // ── Preview item placement ────────────────────────────────────────────
         val previewModelId = player.inventory.itemInMainHand.itemMeta
             ?.persistentDataContainer?.get(ssgItemCommand.previewModelKey, PersistentDataType.STRING)
@@ -276,6 +280,22 @@ class AxleInteractListener(
         if (block.type == Material.BARRIER) block.type = Material.AIR
     }
 
+    /**
+     * Blocos cujo clique direito executa uma ação no vanilla (abrir, alternar, usar).
+     * Interfaces de BlockData cobrem famílias inteiras (todas as portas, botões…);
+     * o set cobre os blocos de estação que não têm interface própria.
+     */
+    private fun isInteractive(block: org.bukkit.block.Block): Boolean {
+        val data = block.blockData
+        if (data is org.bukkit.block.data.Openable) return true          // portas, trapdoors, portões
+        if (data is org.bukkit.block.data.type.Switch) return true       // alavancas e botões
+        if (data is org.bukkit.block.data.type.Bed) return true
+        val state = block.state
+        if (state is org.bukkit.block.Container) return true             // baús, fornalhas, hoppers…
+        if (state is org.bukkit.block.Sign) return true                  // clique direito edita
+        return block.type in INTERACTIVE_BLOCKS
+    }
+
     private fun heldGearType(player: Player): GearType? {
         val model = player.inventory.itemInMainHand.itemMeta?.itemModel
         return when (model) {
@@ -300,4 +320,17 @@ class AxleInteractListener(
             ?.persistentDataContainer
             ?.get(rpmKey, PersistentDataType.FLOAT)
             ?: 10f
+
+    companion object {
+        private val INTERACTIVE_BLOCKS = setOf(
+            Material.CRAFTING_TABLE, Material.ENDER_CHEST, Material.ENCHANTING_TABLE,
+            Material.ANVIL, Material.CHIPPED_ANVIL, Material.DAMAGED_ANVIL,
+            Material.GRINDSTONE, Material.STONECUTTER, Material.SMITHING_TABLE,
+            Material.CARTOGRAPHY_TABLE, Material.LOOM, Material.BELL,
+            Material.NOTE_BLOCK, Material.JUKEBOX, Material.COMPOSTER,
+            Material.REPEATER, Material.COMPARATOR, Material.DAYLIGHT_DETECTOR,
+            Material.LECTERN, Material.BEACON, Material.RESPAWN_ANCHOR,
+            Material.CRAFTER
+        )
+    }
 }
