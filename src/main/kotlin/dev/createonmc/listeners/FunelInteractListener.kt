@@ -2,9 +2,10 @@ package dev.createonmc.listeners
 
 import dev.createonmc.axle.AxlePos
 import dev.createonmc.gear.GearManager
+import dev.createonmc.nexo.NexoCompat
+import dev.createonmc.nexo.NexoIds
 import org.bukkit.Location
 import org.bukkit.Material
-import org.bukkit.NamespacedKey
 import org.bukkit.entity.ItemDisplay
 import org.bukkit.entity.Player
 import org.bukkit.event.EventHandler
@@ -18,7 +19,6 @@ import java.util.UUID
 
 class FunelInteractListener(private val gearManager: GearManager, private val plugin: Plugin) : Listener {
 
-    private val funelModel = NamespacedKey("ssggearmachine", "funel")
     private val recentInteracts = mutableMapOf<UUID, Long>()
 
     @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
@@ -57,7 +57,7 @@ class FunelInteractListener(private val gearManager: GearManager, private val pl
     }
 
     private fun isFunelItem(player: Player): Boolean =
-        player.inventory.itemInMainHand.itemMeta?.itemModel == funelModel
+        NexoCompat.idOf(player.inventory.itemInMainHand) == NexoIds.FUNEL
 
     private fun debounce(uuid: UUID): Boolean {
         val now = System.currentTimeMillis()

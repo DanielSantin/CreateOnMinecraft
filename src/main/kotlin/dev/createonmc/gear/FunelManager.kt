@@ -2,6 +2,8 @@ package dev.createonmc.gear
 
 import dev.createonmc.CreateOnMinecraftPlugin
 import dev.createonmc.axle.AxlePos
+import dev.createonmc.nexo.NexoCompat
+import dev.createonmc.nexo.NexoIds
 import dev.createonmc.util.RotationUtil
 import org.bukkit.Material
 import org.bukkit.NamespacedKey
@@ -77,6 +79,9 @@ class FunelManager(
         funelsByUuid[display.uniqueId] = entry
         funelsByContainerPos[containerPos] = display.uniqueId
         addFunelInteractor(belt, slotIndex, containerPos, state, towardX, towardZ)
+        // Force BeltManager to resync this belt's ALIGNED funel icons on the very next tick instead
+        // of waiting for the belt to actually change direction (which may not happen for a while).
+        belt.lastForward = null
         return true
     }
 
@@ -234,6 +239,7 @@ class FunelManager(
                 funelsByUuid[entity.uniqueId] = entry
                 funelsByContainerPos[containerPos] = entity.uniqueId
                 addFunelInteractor(belt, slotIndex, containerPos, state, towardX, towardZ)
+                belt.lastForward = null
                 count++
             }
         }
@@ -241,9 +247,8 @@ class FunelManager(
     }
 
     fun giveItem(): ItemStack {
-        val stack = ItemStack(Material.STICK)
+        val stack = NexoCompat.item(NexoIds.FUNEL)
         val meta = stack.itemMeta ?: return stack
-        meta.setItemModel(NamespacedKey("ssggearmachine", "funel"))
         meta.setDisplayName("§rFunel")
         stack.itemMeta = meta
         return stack
@@ -262,11 +267,7 @@ class FunelManager(
     }
 
     private fun displayItem(state: FunelState): ItemStack {
-        val modelId = if (state == FunelState.IN) "states/funel_in" else "states/funel_out"
-        val stack = ItemStack(Material.STICK)
-        val meta = stack.itemMeta ?: return stack
-        meta.setItemModel(NamespacedKey("ssggearmachine", modelId))
-        stack.itemMeta = meta
-        return stack
+        val nexoId = if (state == FunelState.IN) NexoIds.FUNEL_IN else NexoIds.FUNEL_OUT
+        return NexoCompat.item(nexoId)
     }
 }

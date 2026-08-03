@@ -4,6 +4,7 @@ main: dev.createonmc.CreateOnMinecraftPlugin
 api-version: "26.1.2"
 description: Recreating the Create mod as a Paper plugin
 author: Demarky
+depend: [Nexo]
 
 commands:
   ssggive:

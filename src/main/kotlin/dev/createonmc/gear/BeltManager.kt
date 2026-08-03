@@ -3,6 +3,8 @@ package dev.createonmc.gear
 import dev.createonmc.CreateOnMinecraftPlugin
 import dev.createonmc.axle.AxleAxis
 import dev.createonmc.axle.AxlePos
+import dev.createonmc.nexo.NexoCompat
+import dev.createonmc.nexo.NexoIds
 import dev.createonmc.util.RotationUtil
 import org.bukkit.Location
 import org.bukkit.Material
@@ -344,11 +346,16 @@ class BeltManager(
         val signedSpeed = baseDpt * refEntry.speedMultiplier * dirSign * BELT_SPEED_FACTOR
         val forward     = signedSpeed > 0f
 
-        if (tickCount % 4 == 0) pickupItemEntities(world, belt, posA, stepX, stepZ)
-        if (tickCount % 8 == 0) {
-            tickBeltInteractorsInsert(world, belt, posA, stepX, stepZ, forward)
+        // Funel display icons only need to change when direction actually flips (motor reversal,
+        // water wheel flow change, belt rebuild, ...) — comparing against the cached value is free,
+        // so this replaces re-scanning + re-setting every funel's texture on a fixed tick cadence.
+        if (forward != belt.lastForward) {
+            belt.lastForward = forward
             syncFunelAutoDisplays(belt, stepX, stepZ, forward)
         }
+
+        if (tickCount % 4 == 0) pickupItemEntities(world, belt, posA, stepX, stepZ)
+        if (tickCount % 8 == 0) tickBeltInteractorsInsert(world, belt, posA, stepX, stepZ, forward)
 
         if (signedSpeed == 0f || belt.items.isEmpty()) return
 
@@ -518,10 +525,10 @@ class BeltManager(
     }
 
     /**
-     * Keeps each ALIGNED funel's displayed icon (funel_in/funel_out) matching the direction it is
-     * currently acting in. Unlike fixed funels, an auto funel's role flips at runtime whenever the
-     * belt reverses (mechanical drives aren't one-directional), so this can't be decided once at
-     * placement time — it must be re-evaluated on the same cadence as the actual item transfer logic.
+     * Pushes the current direction to every ALIGNED funel on [belt]. Only called by [tickBelt] when
+     * `forward` actually changed since the last check (see [BeltEntry.lastForward]) — not on a fixed
+     * cadence — so this only runs on real events: a motor/water-wheel reversal, the belt stopping or
+     * starting, a belt rebuild changing its step direction, or a funel just being (re)placed.
      */
     private fun syncFunelAutoDisplays(belt: BeltEntry, stepX: Int, stepZ: Int, forward: Boolean) {
         for ((_, interactors) in belt.interactors) {
@@ -806,19 +813,7 @@ class BeltManager(
 
     // ─── Display item helpers ─────────────────────────────────────────────────
 
-    fun beltSpinItem(): ItemStack {
-        val stack = ItemStack(Material.STICK)
-        val meta  = stack.itemMeta ?: return stack
-        meta.setItemModel(NamespacedKey("ssggearmachine", "parts/esteira_spin"))
-        stack.itemMeta = meta
-        return stack
-    }
+    fun beltSpinItem(): ItemStack = NexoCompat.item(NexoIds.ESTEIRA_SPIN)
 
-    fun beltFixedItem(): ItemStack {
-        val stack = ItemStack(Material.STICK)
-        val meta  = stack.itemMeta ?: return stack
-        meta.setItemModel(NamespacedKey("ssggearmachine", "parts/esteira_fixed"))
-        stack.itemMeta = meta
-        return stack
-    }
+    fun beltFixedItem(): ItemStack = NexoCompat.item(NexoIds.ESTEIRA_FIXED)
 }

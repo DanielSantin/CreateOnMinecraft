@@ -3,6 +3,8 @@ package dev.createonmc.gear
 import dev.createonmc.CreateOnMinecraftPlugin
 import dev.createonmc.axle.AxleAxis
 import dev.createonmc.axle.AxlePos
+import dev.createonmc.nexo.NexoCompat
+import dev.createonmc.nexo.NexoIds
 import dev.createonmc.util.RotationUtil
 import org.bukkit.Location
 import org.bukkit.Material
@@ -832,52 +834,25 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         Quaternionf(orientQ).mul(RotationUtil.axisAngle(0f, 1f, 0f, angle))
 
     private fun gearItem(type: GearType): ItemStack {
-        val modelKey = when (type) {
-            GearType.COGWHEEL       -> NamespacedKey("ssggearmachine", "gear")
-            GearType.LARGE_COGWHEEL -> NamespacedKey("ssggearmachine", "biggear")
-            GearType.AXLE           -> NamespacedKey("ssggearmachine", "eixo")
-            GearType.MOTOR          -> NamespacedKey("ssggearmachine", "motor")
-            GearType.WATER_WHEEL    -> NamespacedKey("ssggearmachine", "parts/water_wheel_spin")
-            GearType.MILLSTONE      -> NamespacedKey("ssggearmachine", "parts/millstone_spin")
+        val nexoId = when (type) {
+            GearType.COGWHEEL       -> NexoIds.COGWHEEL
+            GearType.LARGE_COGWHEEL -> NexoIds.LARGE_COGWHEEL
+            GearType.AXLE           -> NexoIds.AXLE
+            GearType.MOTOR          -> NexoIds.MOTOR
+            GearType.WATER_WHEEL    -> NexoIds.WATER_WHEEL_SPIN
+            GearType.MILLSTONE      -> NexoIds.MILLSTONE_SPIN
         }
-        val stack = ItemStack(Material.STICK)
-        val meta: ItemMeta = stack.itemMeta ?: return stack
-        meta.setItemModel(modelKey)
-        stack.itemMeta = meta
-        return stack
+        return NexoCompat.item(nexoId)
     }
 
+    private fun millstoneFixedItem(): ItemStack = NexoCompat.item(NexoIds.MILLSTONE_FIXED)
 
-
-    private fun millstoneFixedItem(): ItemStack {
-        val stack = ItemStack(Material.STICK)
-        val meta: ItemMeta = stack.itemMeta ?: return stack
-        meta.setItemModel(NamespacedKey("ssggearmachine", "parts/millstone_fixed"))
-        stack.itemMeta = meta
-        return stack
-    }
-
-    private fun waterWheelFixoItem(): ItemStack {
-        val stack = ItemStack(Material.STICK)
-        val meta: ItemMeta = stack.itemMeta ?: return stack
-        meta.setItemModel(NamespacedKey("ssggearmachine", "parts/water_wheel_fixed"))
-        stack.itemMeta = meta
-        return stack
-    }
+    private fun waterWheelFixoItem(): ItemStack = NexoCompat.item(NexoIds.WATER_WHEEL_FIXED)
 
     private fun gearDropItem(type: GearType): ItemStack {
-        val (modelId, displayName) = when (type) {
-            GearType.COGWHEEL       -> "gear"        to "Cogwheel"
-            GearType.LARGE_COGWHEEL -> "biggear"     to "Large Cogwheel"
-            GearType.AXLE           -> "eixo"        to "Axle"
-            GearType.MOTOR          -> "motor"       to "Motor"
-            GearType.WATER_WHEEL    -> "water_wheel" to "Water Wheel"
-            GearType.MILLSTONE      -> "millstone"   to "Millstone"
-        }
-        val stack = ItemStack(Material.STICK)
+        val stack = NexoCompat.item(NexoIds.idFor(type))
         val meta: ItemMeta = stack.itemMeta ?: return stack
-        meta.setItemModel(NamespacedKey("ssggearmachine", modelId))
-        meta.setDisplayName("§r$displayName")
+        meta.setDisplayName("§r${NexoIds.labelFor(type)}")
         stack.itemMeta = meta
         return stack
     }

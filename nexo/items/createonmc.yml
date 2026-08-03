@@ -1,0 +1,118 @@
+# Nexo item registry for CreateOnMinecraft.
+#
+# WHERE THIS GOES: copy this file to plugins/Nexo/items/createonmc.yml on the server,
+# then run /nexo reload (or restart) so Nexo picks it up.
+#
+# WHAT THIS DOES (and doesn't do): every entry below is a *plain* Nexo item — no
+# `Mechanics:` block, so none of them are registered as a NexoBlock or NexoFurniture.
+# CreateOnMinecraft keeps 100% of its own placement/removal logic (barrier blocks +
+# ItemDisplay entities in GearManager/BeltManager/FunelManager); Nexo is only used
+# here as the item registry + model layer, so there is no overlap with Nexo's own
+# custom-block placement/breaking listeners.
+#
+# MODELS: `Components.item_model` points at the SAME model ids the plugin already
+# used directly (namespace `ssggearmachine`), so the existing SSGGearMachine resource
+# pack keeps working unchanged — this migration does not require rebuilding or
+# regenerating any models/textures. Make sure the ssggearmachine pack is still merged
+# into the resource pack the server serves (as an extra pack alongside Nexo's, or
+# copied into Nexo's own pack folder) — Nexo does not need to "own" these assets,
+# it just needs them present in the final pack the client downloads.
+#
+# MATERIAL: every id below MUST stay `material: STICK`. CreateOnMinecraft's placement
+# handler (AxleInteractListener.onRightClickBlock) gates on the held item's *material*
+# before it even checks the Nexo id — a different base material silently disables
+# placement even though NexoItems.idFromItem() would still resolve correctly.
+#
+# IDS: keep these exact keys — they're hardcoded in dev.createonmc.nexo.NexoIds and
+# matched 1:1 in code (GearManager, BeltManager, FunelManager, AxleInteractListener,
+# FunelInteractListener, SSGGiveCommand).
+
+# ── Held items (given via /ssggive, placed by right-click) ──────────────────
+gear:
+  itemname: "<white>Cogwheel"
+  material: STICK
+  Components:
+    item_model: ssggearmachine:gear
+
+biggear:
+  itemname: "<white>Large Cogwheel"
+  material: STICK
+  Components:
+    item_model: ssggearmachine:biggear
+
+eixo:
+  itemname: "<white>Axle"
+  material: STICK
+  Components:
+    item_model: ssggearmachine:eixo
+
+motor:
+  itemname: "<white>Motor"
+  material: STICK
+  Components:
+    item_model: ssggearmachine:motor
+
+water_wheel:
+  itemname: "<white>Water Wheel"
+  material: STICK
+  Components:
+    item_model: ssggearmachine:water_wheel
+
+millstone:
+  itemname: "<white>Millstone"
+  material: STICK
+  Components:
+    item_model: ssggearmachine:millstone
+
+esteira:
+  itemname: "<white>Esteira"
+  material: STICK
+  Components:
+    item_model: ssggearmachine:esteira
+
+funel:
+  itemname: "<white>Funel"
+  material: STICK
+  Components:
+    item_model: ssggearmachine:funel
+
+# ── Display-only items (set on ItemDisplay entities, never held/given) ──────
+water_wheel_spin:
+  material: STICK
+  Components:
+    item_model: ssggearmachine:parts/water_wheel_spin
+
+water_wheel_fixed:
+  material: STICK
+  Components:
+    item_model: ssggearmachine:parts/water_wheel_fixed
+
+millstone_spin:
+  material: STICK
+  Components:
+    item_model: ssggearmachine:parts/millstone_spin
+
+millstone_fixed:
+  material: STICK
+  Components:
+    item_model: ssggearmachine:parts/millstone_fixed
+
+esteira_spin:
+  material: STICK
+  Components:
+    item_model: ssggearmachine:parts/esteira_spin
+
+esteira_fixed:
+  material: STICK
+  Components:
+    item_model: ssggearmachine:parts/esteira_fixed
+
+funel_in:
+  material: STICK
+  Components:
+    item_model: ssggearmachine:states/funel_in
+
+funel_out:
+  material: STICK
+  Components:
+    item_model: ssggearmachine:states/funel_out

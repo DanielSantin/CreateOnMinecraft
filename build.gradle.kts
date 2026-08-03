@@ -1,5 +1,6 @@
 plugins {
-    kotlin("jvm") version "2.2.0"
+    // 2.4.10+ needed to read Nexo 1.26.0's Kotlin 2.4.0 metadata — see repo Kotlin bump.
+    kotlin("jvm") version "2.4.10"
     id("com.gradleup.shadow") version "8.3.5"
 }
 
@@ -9,10 +10,12 @@ version = "1.0-SNAPSHOT"
 repositories {
     mavenCentral()
     maven("https://repo.papermc.io/repository/maven-public/")
+    maven("https://repo.nexomc.com/releases")
 }
 
 dependencies {
     compileOnly("io.papermc.paper:paper-api:26.1.2.build.64-stable")
+    compileOnly("com.nexomc:nexo:1.26.0")
     implementation(kotlin("stdlib"))
 }
 

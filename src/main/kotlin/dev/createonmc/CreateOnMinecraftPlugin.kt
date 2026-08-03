@@ -12,6 +12,8 @@ import dev.createonmc.listeners.FunelInteractListener
 import dev.createonmc.listeners.GearChunkListener
 import dev.createonmc.listeners.GearRemoveListener
 import dev.createonmc.listeners.WaterDebugListener
+import dev.createonmc.nexo.NexoCompat
+import dev.createonmc.nexo.NexoLoadListener
 import org.bukkit.plugin.java.JavaPlugin
 
 class CreateOnMinecraftPlugin : JavaPlugin() {
@@ -22,6 +24,8 @@ class CreateOnMinecraftPlugin : JavaPlugin() {
     val ssgItemCommand = SSGItemCommand()
 
     override fun onEnable() {
+        NexoCompat.init(this)
+        server.pluginManager.registerEvents(NexoLoadListener(), this)
         MillstoneRecipes.load(this)
         gearManager = GearManager(this)
         server.pluginManager.registerEvents(AxleInteractListener(gearManager, stressCommand, ssgItemCommand), this)

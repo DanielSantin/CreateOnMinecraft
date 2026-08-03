@@ -13,4 +13,11 @@ class BeltEntry(
 
     /** slotIndex → interactors registered at that slot (hoppers, future extractors/inserters). */
     val interactors: MutableMap<Int, MutableList<BeltInteractor>> = mutableMapOf()
+
+    /**
+     * Direction reported to ALIGNED funels the last time it was checked. Null forces a
+     * resync on the next tick (used when a funel is (re)placed). Lets [BeltManager] only
+     * touch funel displays on an actual direction change instead of on a fixed cadence.
+     */
+    var lastForward: Boolean? = null
 }

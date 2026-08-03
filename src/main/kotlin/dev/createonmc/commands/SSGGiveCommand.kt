@@ -1,6 +1,7 @@
 package dev.createonmc.commands
 
-import org.bukkit.Material
+import dev.createonmc.nexo.NexoCompat
+import dev.createonmc.nexo.NexoIds
 import org.bukkit.NamespacedKey
 import org.bukkit.command.Command
 import org.bukkit.command.CommandExecutor
@@ -26,13 +27,13 @@ class SSGGiveCommand : CommandExecutor, TabCompleter {
         }
 
         val stack = when (type) {
-            "gear"        -> makeItem("gear", "Cogwheel")
-            "biggear"     -> makeItem("biggear", "Large Cogwheel")
-            "eixo"        -> makeItem("eixo", "Axle")
-            "water_wheel" -> makeItem("water_wheel", "Water Wheel")
-            "millstone"   -> makeItem("millstone", "Millstone")
-            "esteira"     -> makeItem("esteira", "Esteira")
-            "funel"       -> makeItem("funel", "Funel")
+            "gear"        -> makeItem(NexoIds.COGWHEEL, "Cogwheel")
+            "biggear"     -> makeItem(NexoIds.LARGE_COGWHEEL, "Large Cogwheel")
+            "eixo"        -> makeItem(NexoIds.AXLE, "Axle")
+            "water_wheel" -> makeItem(NexoIds.WATER_WHEEL, "Water Wheel")
+            "millstone"   -> makeItem(NexoIds.MILLSTONE, "Millstone")
+            "esteira"     -> makeItem(NexoIds.ESTEIRA, "Esteira")
+            "funel"       -> makeItem(NexoIds.FUNEL, "Funel")
             "motor" -> {
                 val rpm = args.getOrNull(1)?.toFloatOrNull() ?: 10f
                 if (rpm == 0f) { sender.sendMessage("RPM cannot be 0."); return true }
@@ -61,19 +62,17 @@ class SSGGiveCommand : CommandExecutor, TabCompleter {
         }
     }
 
-    private fun makeItem(modelId: String, displayName: String): ItemStack {
-        val stack = ItemStack(Material.STICK)
-        val meta = stack.itemMeta!!
-        meta.setItemModel(NamespacedKey("ssggearmachine", modelId))
+    private fun makeItem(nexoId: String, displayName: String): ItemStack {
+        val stack = NexoCompat.item(nexoId)
+        val meta = stack.itemMeta ?: return stack
         meta.setDisplayName("§r$displayName")
         stack.itemMeta = meta
         return stack
     }
 
     private fun makeMotor(rpm: Float): ItemStack {
-        val stack = ItemStack(Material.STICK)
-        val meta = stack.itemMeta!!
-        meta.setItemModel(NamespacedKey("ssggearmachine", "motor"))
+        val stack = NexoCompat.item(NexoIds.MOTOR)
+        val meta = stack.itemMeta ?: return stack
         meta.setDisplayName("§rMotor §7(${rpm} RPM)")
         meta.persistentDataContainer.set(rpmKey, PersistentDataType.FLOAT, rpm)
         stack.itemMeta = meta

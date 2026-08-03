@@ -7,6 +7,8 @@ import dev.createonmc.commands.SSGItemCommand
 import dev.createonmc.gear.GearManager
 import dev.createonmc.gear.MillstoneData
 import dev.createonmc.gear.GearType
+import dev.createonmc.nexo.NexoCompat
+import dev.createonmc.nexo.NexoIds
 import dev.createonmc.util.AxleUtil
 import org.bukkit.Location
 import org.bukkit.Material
@@ -32,7 +34,6 @@ class AxleInteractListener(
 ) : Listener {
 
     private val rpmKey = NamespacedKey("createonmc", "motor_rpm")
-    private val esteiraModel = NamespacedKey("ssggearmachine", "esteira")
     // Guard against Paper firing PlayerInteractEvent for both hands in the same tick
     private val recentPlacements = mutableMapOf<UUID, Long>()
     // Preview displays: barrier pos → ItemDisplay UUID (in-memory only, no persistence needed)
@@ -81,7 +82,7 @@ class AxleInteractListener(
                 }
 
                 // Belt tool: select axle A or B
-                if (player.inventory.itemInMainHand.itemMeta?.itemModel == esteiraModel) {
+                if (NexoCompat.idOf(player.inventory.itemInMainHand) == NexoIds.ESTEIRA) {
                     event.isCancelled = true
                     handleBeltSelection(player, pos, entry)
                     return
@@ -296,18 +297,8 @@ class AxleInteractListener(
         return block.type in INTERACTIVE_BLOCKS
     }
 
-    private fun heldGearType(player: Player): GearType? {
-        val model = player.inventory.itemInMainHand.itemMeta?.itemModel
-        return when (model) {
-            NamespacedKey("ssggearmachine", "gear")        -> GearType.COGWHEEL
-            NamespacedKey("ssggearmachine", "biggear")     -> GearType.LARGE_COGWHEEL
-            NamespacedKey("ssggearmachine", "eixo")        -> GearType.AXLE
-            NamespacedKey("ssggearmachine", "motor")       -> GearType.MOTOR
-            NamespacedKey("ssggearmachine", "water_wheel") -> GearType.WATER_WHEEL
-            NamespacedKey("ssggearmachine", "millstone")   -> GearType.MILLSTONE
-            else                                           -> null
-        }
-    }
+    private fun heldGearType(player: Player): GearType? =
+        NexoIds.gearTypeFromId(NexoCompat.idOf(player.inventory.itemInMainHand))
 
     private fun motorParams(gearType: GearType, player: Player): Pair<Boolean, Float> = when (gearType) {
         GearType.MOTOR       -> Pair(true, heldMotorRpm(player))
