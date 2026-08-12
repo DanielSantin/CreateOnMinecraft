@@ -39,13 +39,22 @@ tasks {
         archiveBaseName.set("SSGCreateOnMinecraft")
         archiveClassifier.set("")
         relocate("kotlin", "dev.createonmc.kotlin")
-        destinationDirectory.set(file("$serverDir/plugins"))
-        doLast {
-            println("📦 JAR copiado para: ${destinationDirectory.get()}/${archiveFileName.get()}")
-            println("ℹ️  O servidor NÃO foi reiniciado — rode 'systemctl restart ssg-paper' manualmente quando quiser aplicar.")
-        }
     }
     build {
         dependsOn(shadowJar)
+    }
+
+    // Deploy manual para o servidor de produção. NÃO roda automaticamente com
+    // build/shadowJar — invoque explicitamente: ./gradlew deployProd
+    register<Copy>("deployProd") {
+        group = "deployment"
+        description = "Copia o jar para a pasta plugins/ do servidor de produção"
+        dependsOn(shadowJar)
+        from(shadowJar.get().archiveFile)
+        into("$serverDir/plugins")
+        doLast {
+            println("📦 JAR copiado para: $serverDir/plugins/${shadowJar.get().archiveFileName.get()}")
+            println("ℹ️  O servidor NÃO foi reiniciado — rode 'systemctl restart ssg-paper' manualmente quando quiser aplicar.")
+        }
     }
 }
