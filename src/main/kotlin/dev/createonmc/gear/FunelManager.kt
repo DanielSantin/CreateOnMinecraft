@@ -14,6 +14,7 @@ import org.bukkit.inventory.ItemStack
 import org.bukkit.persistence.PersistentDataType
 import org.joml.Quaternionf
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 
 class FunelManager(
     private val plugin: CreateOnMinecraftPlugin,
@@ -23,8 +24,8 @@ class FunelManager(
         private const val FUNEL_SCALE = 1f
     }
 
-    private val funelsByUuid         = mutableMapOf<UUID, FunelEntry>()
-    private val funelsByContainerPos = mutableMapOf<AxlePos, UUID>()
+    private val funelsByUuid         = ConcurrentHashMap<UUID, FunelEntry>()
+    private val funelsByContainerPos = ConcurrentHashMap<AxlePos, UUID>()
 
     private val pdcContainerPos = NamespacedKey(plugin, "funel_container_pos")
     private val pdcState        = NamespacedKey(plugin, "funel_state")
@@ -214,9 +215,12 @@ class FunelManager(
                 val faceName = pdc.get(pdcFace, PersistentDataType.STRING)
                 val savedFace = faceName?.let { runCatching { BlockFace.valueOf(it) }.getOrNull() }
                     ?: continue
-                entity.transformation = org.bukkit.util.Transformation(
-                    entity.transformation.translation, RotationUtil.fromBlockFace(savedFace),
-                    entity.transformation.scale, Quaternionf())
+                // Mutação do display precisa rodar no scheduler da própria entidade.
+                entity.scheduler.run(plugin, { t ->
+                    entity.transformation = org.bukkit.util.Transformation(
+                        entity.transformation.translation, RotationUtil.fromBlockFace(savedFace),
+                        entity.transformation.scale, Quaternionf())
+                }, null)
 
                 val barrierPos = AxlePos(world.name, entity.location.blockX, entity.location.blockY, entity.location.blockZ)
                 val faceModX = (barrierPos.bx - containerPos.bx).coerceIn(-1, 1)

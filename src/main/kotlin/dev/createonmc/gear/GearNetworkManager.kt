@@ -4,6 +4,7 @@ import dev.createonmc.CreateOnMinecraftPlugin
 import dev.createonmc.axle.AxleAxis
 import dev.createonmc.axle.AxlePos
 import org.bukkit.World
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Owns gear network state and all topology/stress logic.
@@ -19,7 +20,7 @@ class GearNetworkManager(
     private val beltsByAxle: MutableMap<AxlePos, BeltEntry>,
     private val onRemoveGear: (World, Int, Int, Int) -> Unit
 ) {
-    val networks = mutableMapOf<Int, GearNetwork>()
+    val networks = ConcurrentHashMap<Int, GearNetwork>()
     private var nextNetworkId = 0
 
     companion object {

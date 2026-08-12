@@ -6,6 +6,8 @@ import dev.createonmc.axle.AxlePos
 import dev.createonmc.nexo.NexoCompat
 import dev.createonmc.nexo.NexoIds
 import dev.createonmc.util.RotationUtil
+import io.papermc.paper.threadedregions.scheduler.ScheduledTask
+import org.bukkit.Bukkit
 import org.bukkit.Location
 import org.bukkit.Material
 import org.bukkit.NamespacedKey
@@ -18,6 +20,7 @@ import org.bukkit.util.Transformation
 import org.joml.Quaternionf
 import org.joml.Vector3f
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 
 class GearManager(private val plugin: CreateOnMinecraftPlugin) {
 
@@ -39,11 +42,13 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
     private val colliderOffsets: Map<GearType, List<Triple<Int,Int,Int>>> =
         GearType.values().associateWith { listOf(Triple(0, 0, 0)) }
 
-    private val gearsByPos = mutableMapOf<AxlePos, GearEntry>()
-    val millstoneData = mutableMapOf<AxlePos, MillstoneData>()
+    // ConcurrentHashMap: pode ser lido/escrito por diferentes threads de região no Folia
+    // (tick de rede/moinho/esteira despachado por posição, além dos listeners de bloco).
+    private val gearsByPos = ConcurrentHashMap<AxlePos, GearEntry>()
+    val millstoneData = ConcurrentHashMap<AxlePos, MillstoneData>()
     /** Shared maps — passed by reference to sub-managers so mutations are visible everywhere. */
-    private val beltsByAxle  = mutableMapOf<AxlePos, BeltEntry>()
-    internal val beltBlockPos = mutableMapOf<AxlePos, Pair<BeltEntry, Int>>()
+    private val beltsByAxle  = ConcurrentHashMap<AxlePos, BeltEntry>()
+    internal val beltBlockPos = ConcurrentHashMap<AxlePos, Pair<BeltEntry, Int>>()
     val funel = FunelManager(plugin, beltBlockPos)
     private val networkMgr = GearNetworkManager(plugin, gearsByPos, beltsByAxle) { w, bx, by, bz -> removeGear(w, bx, by, bz) }
     val networks get() = networkMgr.networks
@@ -55,7 +60,7 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
     private var tickCount = 0
     // Belt restoration is debounced: fires 20 ticks after the last chunk load so all
     // adjacent chunks (and their gear entities) are ready before we try to re-attach.
-    private var pendingBeltRestoreTaskId = -1
+    private var pendingBeltRestoreTask: ScheduledTask? = null
 
     // ─── PDC keys (stored on the ItemDisplay entity for persistence) ────────
     private val pdcGearType    = NamespacedKey(plugin, "gear_type")
@@ -75,9 +80,9 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
     private val pdcMsProgress   = NamespacedKey(plugin, "ms_progress")
 
     init {
-        plugin.server.scheduler.runTaskTimer(plugin, Runnable { tick() }, 0L, 1L)
+        Bukkit.getGlobalRegionScheduler().runAtFixedRate(plugin, { tick() }, 1L, 1L)
         // Delay restore by 1 tick so all worlds/chunks are ready
-        plugin.server.scheduler.runTask(plugin, Runnable { restoreFromWorld() })
+        Bukkit.getGlobalRegionScheduler().runDelayed(plugin, { restoreFromWorld() }, 1L)
     }
 
     fun setSpeed(rpm: Float) {
@@ -487,13 +492,12 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         // Debounce belt restoration: reset the 20-tick countdown each time a chunk with
         // untracked belt data loads. This ensures adjacent chunks are in memory before
         // we try to re-attach belts. Skipped entirely when all belts are already tracked.
-        if (pendingBeltRestoreTaskId != -1)
-            plugin.server.scheduler.cancelTask(pendingBeltRestoreTaskId)
-        pendingBeltRestoreTaskId = plugin.server.scheduler.runTaskLater(plugin, Runnable {
-            pendingBeltRestoreTaskId = -1
+        pendingBeltRestoreTask?.cancel()
+        pendingBeltRestoreTask = Bukkit.getGlobalRegionScheduler().runDelayed(plugin, {
+            pendingBeltRestoreTask = null
             belt.restoreBeltsFromWorld()
             funel.restoreFunels()
-        }, 20L).taskId
+        }, 20L)
     }
 
     // ─── Water wheel ─────────────────────────────────────────────────────────
@@ -502,7 +506,10 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
         for ((pos, entry) in gearsByPos) {
             if (entry.gearType != GearType.WATER_WHEEL) continue
             val world = plugin.server.getWorld(pos.worldName) ?: continue
-            entry.motorSpeed = computeWaterWheelDpt(world, pos, entry.axis)
+            val loc = Location(world, pos.bx.toDouble(), pos.by.toDouble(), pos.bz.toDouble())
+            Bukkit.getRegionScheduler().run(plugin, loc) {
+                entry.motorSpeed = computeWaterWheelDpt(world, pos, entry.axis)
+            }
         }
     }
 
@@ -611,93 +618,106 @@ class GearManager(private val plugin: CreateOnMinecraftPlugin) {
             val stepTicks = computeStepTicks(baseDpt, net)
             net.ticksLeft = stepTicks
             net.angle = ((net.angle + baseDpt * stepTicks) % 360f + 360f) % 360f
+            val baseStepAngle = baseDpt * stepTicks
 
-            // Delta quaternion for this step: a small Y-axis rotation.
-            // Each gear multiplies its own currentDisplayQ by this delta scaled
-            // by its speedMultiplier, keeping consecutive quaternions always in
-            // the same hemisphere (dot = cos(Δ/2) > 0 for |Δ| < 180°).
-            val baseStepAngle = baseDpt * stepTicks   // degrees the reference gear advances
-
-            // Performance: many gears in a straight chain share the same speedMultiplier.
-            // Compute axisAngle once per unique multiplier and reuse — avoids N trig
-            // calls for a long axle run (sin/cos per call is the expensive part).
-            val deltaQByMult = HashMap<Float, Quaternionf>(4)
-
-            for (pos in net.members.keys) {
-                val entry = gearsByPos[pos] ?: continue
-                // Fix 1: use cached reference; fall back to getEntity() only on cache miss
-                val display = entry.cachedDisplay?.takeIf { it.isValid }
-                    ?: (plugin.server.getEntity(entry.displayUuid) as? ItemDisplay)
-                        ?.also { entry.cachedDisplay = it }
-                    ?: continue
-
-                val deltaQ = deltaQByMult.getOrPut(entry.speedMultiplier) {
-                    RotationUtil.axisAngle(0f, 1f, 0f, baseStepAngle * entry.speedMultiplier)
-                }
-                val newQ = Quaternionf(entry.currentDisplayQ).mul(deltaQ).normalize()
-                entry.currentDisplayQ = Quaternionf(newQ)
-
-                // Fix 2: scale and rightRotation are always SCALE/IDENTITY_Q — no getTransformation() needed
-                display.transformation = Transformation(entry.translation, newQ, SCALE, IDENTITY_Q)
-                // Fix 3: only call setInterpolationDuration when the value actually changes
-                if (entry.lastInterpolationDuration != stepTicks) {
-                    display.interpolationDuration = stepTicks
-                    entry.lastInterpolationDuration = stepTicks
-                }
-                display.interpolationDelay = 0
+            // Uma rede é um conjunto de engrenagens fisicamente conectadas, então fica
+            // inteira dentro de uma única região na prática — despachada como uma unidade
+            // pra região dona da primeira posição, preservando a consistência do passo.
+            val firstPos = net.members.keys.firstOrNull() ?: continue
+            val world = plugin.server.getWorld(firstPos.worldName) ?: continue
+            val loc = Location(world, firstPos.bx.toDouble(), firstPos.by.toDouble(), firstPos.bz.toDouble())
+            Bukkit.getRegionScheduler().run(plugin, loc) {
+                applyNetworkStep(net, baseStepAngle, stepTicks)
             }
+        }
+    }
+
+    private fun applyNetworkStep(net: GearNetwork, baseStepAngle: Float, stepTicks: Int) {
+        // Performance: many gears in a straight chain share the same speedMultiplier.
+        // Compute axisAngle once per unique multiplier and reuse — avoids N trig
+        // calls for a long axle run (sin/cos per call is the expensive part).
+        val deltaQByMult = HashMap<Float, Quaternionf>(4)
+
+        for (pos in net.members.keys) {
+            val entry = gearsByPos[pos] ?: continue
+            // Fix 1: use cached reference; fall back to getEntity() only on cache miss
+            val display = entry.cachedDisplay?.takeIf { it.isValid }
+                ?: (plugin.server.getEntity(entry.displayUuid) as? ItemDisplay)
+                    ?.also { entry.cachedDisplay = it }
+                ?: continue
+
+            val deltaQ = deltaQByMult.getOrPut(entry.speedMultiplier) {
+                RotationUtil.axisAngle(0f, 1f, 0f, baseStepAngle * entry.speedMultiplier)
+            }
+            val newQ = Quaternionf(entry.currentDisplayQ).mul(deltaQ).normalize()
+            entry.currentDisplayQ = Quaternionf(newQ)
+
+            // Fix 2: scale and rightRotation are always SCALE/IDENTITY_Q — no getTransformation() needed
+            display.transformation = Transformation(entry.translation, newQ, SCALE, IDENTITY_Q)
+            // Fix 3: only call setInterpolationDuration when the value actually changes
+            if (entry.lastInterpolationDuration != stepTicks) {
+                display.interpolationDuration = stepTicks
+                entry.lastInterpolationDuration = stepTicks
+            }
+            display.interpolationDelay = 0
         }
     }
 
     private fun tickMillstones() {
         for ((pos, ms) in millstoneData) {
-            val entry = gearsByPos[pos] ?: continue
+            val world = plugin.server.getWorld(pos.worldName) ?: continue
+            val loc = Location(world, pos.bx.toDouble(), pos.by.toDouble(), pos.bz.toDouble())
+            Bukkit.getRegionScheduler().run(plugin, loc) { tickMillstone(pos, ms) }
+        }
+    }
 
-            // Hopper I/O: every 8 ticks (matches vanilla hopper transfer rate)
-            if (tickCount % 8 == 0) tickMillstoneHoppers(pos, ms, entry)
+    private fun tickMillstone(pos: AxlePos, ms: MillstoneData) {
+        val entry = gearsByPos[pos] ?: return
 
-            // ── Processing (requires network power) ──────────────────────────
-            val recipe = ms.currentRecipe ?: continue
-            if (ms.inputCount <= 0) continue
-            if (ms.outputItems.sumOf { it.amount } >= MillstoneData.MAX_OUTPUT_STACKS * recipe.primary.item.maxStackSize) continue
+        // Hopper I/O: every 8 ticks (matches vanilla hopper transfer rate)
+        if (tickCount % 8 == 0) tickMillstoneHoppers(pos, ms, entry)
 
-            val network = networks[entry.networkId] ?: continue
-            val baseDpt = networkEffectiveDpt(network)
-            if (baseDpt == 0f) continue
-            val rpm = baseDpt * entry.speedMultiplier * (20f * 60f) / 360f
+        // ── Processing (requires network power) ──────────────────────────
+        val recipe = ms.currentRecipe ?: return
+        if (ms.inputCount <= 0) return
+        if (ms.outputItems.sumOf { it.amount } >= MillstoneData.MAX_OUTPUT_STACKS * recipe.primary.item.maxStackSize) return
 
-            ms.progressTicks += ms.processingSpeed(rpm)
+        val network = networks[entry.networkId] ?: return
+        val baseDpt = networkEffectiveDpt(network)
+        if (baseDpt == 0f) return
+        val rpm = baseDpt * entry.speedMultiplier * (20f * 60f) / 360f
 
-            // Particle: spray item fragments while processing (every 4 ticks)
-            if (tickCount % 4 == 0) {
-                val mat = ms.inputItem ?: continue
-                val world = plugin.server.getWorld(pos.worldName) ?: continue
-                val pLoc = Location(world, pos.bx + 0.5, pos.by + 0.6, pos.bz + 0.5)
-                world.spawnParticle(
-                    org.bukkit.Particle.ITEM,
-                    pLoc,
-                    6,
-                    0.25, 0.15, 0.25,
-                    0.08,
-                    org.bukkit.inventory.ItemStack(mat)
-                )
+        ms.progressTicks += ms.processingSpeed(rpm)
+
+        // Particle: spray item fragments while processing (every 4 ticks)
+        if (tickCount % 4 == 0) {
+            val mat = ms.inputItem ?: return
+            val world = plugin.server.getWorld(pos.worldName) ?: return
+            val pLoc = Location(world, pos.bx + 0.5, pos.by + 0.6, pos.bz + 0.5)
+            world.spawnParticle(
+                org.bukkit.Particle.ITEM,
+                pLoc,
+                6,
+                0.25, 0.15, 0.25,
+                0.08,
+                org.bukkit.inventory.ItemStack(mat)
+            )
+        }
+
+        if (ms.progressTicks >= recipe.processingTime) {
+            ms.progressTicks -= recipe.processingTime
+            ms.inputCount -= 1
+            if (ms.inputCount <= 0) {
+                ms.inputItem = null
+                ms.currentRecipe = null
+                ms.progressTicks = 0
             }
-
-            if (ms.progressTicks >= recipe.processingTime) {
-                ms.progressTicks -= recipe.processingTime
-                ms.inputCount -= 1
-                if (ms.inputCount <= 0) {
-                    ms.inputItem = null
-                    ms.currentRecipe = null
-                    ms.progressTicks = 0
-                }
-                for (result in recipe.rollResults()) {
-                    val output = ms.outputItems.find { it.type == result.item && it.amount < it.maxStackSize }
-                    if (output != null) output.amount += result.count
-                    else ms.outputItems.add(org.bukkit.inventory.ItemStack(result.item, result.count))
-                }
-                entry.cachedDisplay?.let { tagMillstoneState(it, ms) }
+            for (result in recipe.rollResults()) {
+                val output = ms.outputItems.find { it.type == result.item && it.amount < it.maxStackSize }
+                if (output != null) output.amount += result.count
+                else ms.outputItems.add(org.bukkit.inventory.ItemStack(result.item, result.count))
             }
+            entry.cachedDisplay?.let { tagMillstoneState(it, ms) }
         }
     }
 

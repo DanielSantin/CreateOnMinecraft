@@ -2,6 +2,7 @@ package dev.createonmc.listeners
 
 import dev.createonmc.axle.AxlePos
 import dev.createonmc.gear.GearManager
+import org.bukkit.Bukkit
 import org.bukkit.block.Block
 import org.bukkit.event.EventHandler
 import org.bukkit.event.EventPriority
@@ -24,7 +25,7 @@ class BeltBlockListener(
     fun onBlockBreak(event: BlockBreakEvent) {
         val block = event.block
         // Delay 1 tick so the block is actually removed before we re-scan.
-        plugin.server.scheduler.runTask(plugin, Runnable { updateAdjacentBelts(block) })
+        Bukkit.getRegionScheduler().runDelayed(plugin, block.location, { updateAdjacentBelts(block) }, 1L)
     }
 
     private fun updateAdjacentBelts(block: Block) {

@@ -6,6 +6,7 @@ import dev.createonmc.axle.AxlePos
 import dev.createonmc.nexo.NexoCompat
 import dev.createonmc.nexo.NexoIds
 import dev.createonmc.util.RotationUtil
+import org.bukkit.Bukkit
 import org.bukkit.Location
 import org.bukkit.Material
 import org.bukkit.NamespacedKey
@@ -321,7 +322,15 @@ class BeltManager(
 
     fun tickBelts(tickCount: Int) {
         val seen = mutableSetOf<BeltEntry>()
-        for (belt in beltsByAxle.values) if (seen.add(belt)) tickBelt(belt, tickCount)
+        for (belt in beltsByAxle.values) {
+            if (!seen.add(belt)) continue
+            // Uma esteira é física/contígua, então fica dentro de uma única região na
+            // prática — despachada pra região dona da sua primeira posição.
+            val posA = belt.allPositions.firstOrNull() ?: continue
+            val world = plugin.server.getWorld(posA.worldName) ?: continue
+            val loc = Location(world, posA.bx.toDouble(), posA.by.toDouble(), posA.bz.toDouble())
+            Bukkit.getRegionScheduler().run(plugin, loc) { tickBelt(belt, tickCount) }
+        }
     }
 
     private fun tickBelt(belt: BeltEntry, tickCount: Int) {
@@ -672,6 +681,38 @@ class BeltManager(
     fun restoreBeltsFromWorld() {
         data class ItemInfo(val display: ItemDisplay, val stack: ItemStack)
 
+        fun restoreBeltItems(belt: BeltEntry, posA: AxlePos, world: World, infos: List<ItemInfo>, alreadyTracked: MutableSet<UUID>) {
+            val beltPosB = belt.allPositions.last()
+            val stepX = when { beltPosB.bx > posA.bx -> 1; beltPosB.bx < posA.bx -> -1; else -> 0 }
+            val stepZ = when { beltPosB.bz > posA.bz -> 1; beltPosB.bz < posA.bz -> -1; else -> 0 }
+            val dist  = (belt.allPositions.size - 1).toFloat()
+            for ((disp, item) in infos) {
+                if (disp.uniqueId in alreadyTracked) {
+                    plugin.logger.info("[Belt] Skipping restore of item ${disp.uniqueId.toString().takeLast(6)} — already tracked in belt")
+                    continue
+                }
+                val t       = disp.transformation.translation
+                val bxAnchor = (disp.x - 0.5).toInt()
+                val bzAnchor = (disp.z - 0.5).toInt()
+                val offsetX  = posA.bx - bxAnchor
+                val offsetZ  = posA.bz - bzAnchor
+                val beltPos  = ((t.x - offsetX) * stepX + (t.z - offsetZ) * stepZ).coerceIn(0f, dist)
+                disp.teleportDuration  = 0
+                disp.teleport(Location(world, posA.bx + 0.5, posA.by + 0.5, posA.bz + 0.5))
+                disp.interpolationDuration = 0
+                disp.interpolationDelay    = 0
+                disp.transformation = Transformation(
+                    Vector3f(beltPos * stepX, BELT_ITEM_Y_OFFSET, beltPos * stepZ),
+                    beltItemRotation(stepX, stepZ),
+                    Vector3f(BELT_ITEM_SCALE, BELT_ITEM_SCALE, BELT_ITEM_SCALE), GearManager.IDENTITY_Q
+                )
+                val beltItem = BeltItem(disp.uniqueId, item, beltPos, posA.bx, posA.bz)
+                beltItem.cachedDisplay = disp
+                belt.items.add(beltItem)
+                alreadyTracked.add(disp.uniqueId)
+            }
+        }
+
         val posADisplays = mutableMapOf<AxlePos, ItemDisplay>()
         val fixedByPosA  = mutableMapOf<AxlePos, MutableList<UUID>>()
         val itemsByPosA  = mutableMapOf<AxlePos, MutableList<ItemInfo>>()
@@ -732,34 +773,10 @@ class BeltManager(
         for ((posA, infos) in itemsByPosA) {
             val belt  = beltsByAxle[posA] ?: continue
             val world = plugin.server.getWorld(posA.worldName) ?: continue
-            val beltPosB = belt.allPositions.last()
-            val stepX = when { beltPosB.bx > posA.bx -> 1; beltPosB.bx < posA.bx -> -1; else -> 0 }
-            val stepZ = when { beltPosB.bz > posA.bz -> 1; beltPosB.bz < posA.bz -> -1; else -> 0 }
-            val dist  = (belt.allPositions.size - 1).toFloat()
-            for ((disp, item) in infos) {
-                if (disp.uniqueId in alreadyTracked) {
-                    plugin.logger.info("[Belt] Skipping restore of item ${disp.uniqueId.toString().takeLast(6)} — already tracked in belt")
-                    continue
-                }
-                val t       = disp.transformation.translation
-                val bxAnchor = (disp.x - 0.5).toInt()
-                val bzAnchor = (disp.z - 0.5).toInt()
-                val offsetX  = posA.bx - bxAnchor
-                val offsetZ  = posA.bz - bzAnchor
-                val beltPos  = ((t.x - offsetX) * stepX + (t.z - offsetZ) * stepZ).coerceIn(0f, dist)
-                disp.teleportDuration  = 0
-                disp.teleport(Location(world, posA.bx + 0.5, posA.by + 0.5, posA.bz + 0.5))
-                disp.interpolationDuration = 0
-                disp.interpolationDelay    = 0
-                disp.transformation = Transformation(
-                    Vector3f(beltPos * stepX, BELT_ITEM_Y_OFFSET, beltPos * stepZ),
-                    beltItemRotation(stepX, stepZ),
-                    Vector3f(BELT_ITEM_SCALE, BELT_ITEM_SCALE, BELT_ITEM_SCALE), GearManager.IDENTITY_Q
-                )
-                val beltItem = BeltItem(disp.uniqueId, item, beltPos, posA.bx, posA.bz)
-                beltItem.cachedDisplay = disp
-                belt.items.add(beltItem)
-                alreadyTracked.add(disp.uniqueId)
+            // Reposiciona os displays de item da esteira: despachado pra região dona de posA.
+            val loc = Location(world, posA.bx.toDouble(), posA.by.toDouble(), posA.bz.toDouble())
+            Bukkit.getRegionScheduler().run(plugin, loc) {
+                restoreBeltItems(belt, posA, world, infos, alreadyTracked)
             }
         }
 
